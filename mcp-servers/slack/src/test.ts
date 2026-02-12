@@ -33,7 +33,9 @@ if (!token || !channel) {
   process.exit(1);
 }
 
-const slack = new WebClient(token);
+const slack = new WebClient(token, {
+  headers: { "User-Agent": "slack-mcp-server/1.0.0" },
+});
 
 async function test() {
   console.log("═══════════════════════════════════════");

@@ -30,7 +30,15 @@
  *   - slack_team_thread:     팀 스레드 읽기/답장
  *   - slack_team_status:     팀 현황 조회
  *   - slack_team_broadcast:  전체 팀원에게 브로드캐스트
+ *   - slack_team_report:     팀원이 메인 채널 + 팀 채널에 작업 상황 보고
  *   - slack_team_close:      팀 채널 아카이브
+ *
+ * Approval:
+ *   - slack_request_approval: 사용자에게 승인 요청 후 리액션/텍스트 응답 대기
+ *
+ * State Management:
+ *   - slack_save_state:      루프/팀 상태를 파일에 저장
+ *   - slack_load_state:      저장된 상태 복원 (compact/재시작 후 복구)
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -141,7 +149,11 @@ if (!SLACK_BOT_TOKEN) {
   process.exit(1);
 }
 
-const slack = new WebClient(SLACK_BOT_TOKEN);
+const slack = new WebClient(SLACK_BOT_TOKEN, {
+  headers: {
+    "User-Agent": "slack-mcp-server/1.0.0",
+  },
+});
 
 // Bot user ID (resolved on startup)
 let botUserId: string | undefined;
@@ -222,9 +234,12 @@ function getRoleSlackEmoji(role: string): string {
  * Requires chat:write.customize bot scope.
  */
 function agentIdentity(senderId: string, member: TeamMember): { username: string; icon_emoji: string } {
-  const trackSuffix = member.track ? ` [${member.track}]` : "";
+  const trackSuffix = member.track ? `-${member.track}` : "";
+  // Username must be ASCII-safe (no spaces, brackets, or non-ASCII chars)
+  // to avoid "Invalid character in header content" errors
+  const username = `${senderId}${trackSuffix}`.replace(/[^a-zA-Z0-9._-]/g, "-");
   return {
-    username: `${senderId}${trackSuffix}`,
+    username,
     icon_emoji: getRoleSlackEmoji(member.role),
   };
 }
@@ -993,11 +1008,26 @@ server.tool(
   },
   async ({ timestamp, reaction, channel }) => {
     const ch = resolveChannel(channel);
-    await slack.reactions.add({
-      channel: ch,
-      name: reaction,
-      timestamp,
-    });
+    try {
+      await slack.reactions.add({
+        channel: ch,
+        name: reaction,
+        timestamp,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("already_reacted")) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `✅ :${reaction}: 리액션 이미 존재 (ts: ${timestamp})`,
+            },
+          ],
+        };
+      }
+      throw err;
+    }
 
     return {
       content: [
@@ -1856,6 +1886,532 @@ server.tool(
               hint: state.loop?.active
                 ? `루프가 활성 상태였습니다. slack_command_loop(channel='${state.loop.channel}', since_ts='${state.loop.last_ts}')로 재개하세요.`
                 : "루프가 비활성 상태였습니다.",
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+);
+
+// ── Tool: slack_team_report ─────────────────────────────────────
+
+server.tool(
+  "slack_team_report",
+  "팀원이 메인 채널에 작업 상황을 보고합니다. 팀 채널 + 메인 채널에 동시 게시되어 사용자가 전체 진행 상황을 한눈에 파악할 수 있습니다.",
+  {
+    team_id: z.string().describe("팀 식별자"),
+    sender: z.string().describe("보내는 멤버 ID (예: sub-leader-A, rust-impl-A)"),
+    summary: z.string().describe("작업 상황 요약 (메인 채널에 게시됨)"),
+    details: z
+      .string()
+      .optional()
+      .describe("상세 내용 (팀 채널 스레드에만 게시). 미지정 시 요약만 게시."),
+    status: z
+      .enum(["progress", "blocked", "review", "done"])
+      .default("progress")
+      .describe("상태: progress(진행중), blocked(차단), review(검토 필요), done(완료)"),
+    update_member_status: z
+      .enum(["active", "idle", "done"])
+      .optional()
+      .describe("멤버 상태도 함께 업데이트"),
+  },
+  async ({ team_id, sender, summary, details, status, update_member_status }) => {
+    const team = getTeam(team_id);
+    const member = team.members.get(sender);
+    if (!member) {
+      throw new Error(`멤버 '${sender}'가 팀 '${team_id}'에 등록되어 있지 않습니다.`);
+    }
+
+    if (update_member_status) {
+      member.status = update_member_status;
+      saveTeamsToState();
+    }
+
+    const statusEmoji: Record<string, string> = {
+      progress: "🔄",
+      blocked: "🚫",
+      review: "👀",
+      done: "✅",
+    };
+    const statusLabel: Record<string, string> = {
+      progress: "진행중",
+      blocked: "차단됨",
+      review: "검토 필요",
+      done: "완료",
+    };
+
+    const icon = getRoleIcon(member.role);
+    const trackStr = member.track ? ` [${member.track}]` : "";
+    const emoji = statusEmoji[status] || "📋";
+    const label = statusLabel[status] || status;
+
+    // 1) 메인 채널에 요약 게시
+    const mainCh = SLACK_DEFAULT_CHANNEL;
+    if (!mainCh) throw new Error("SLACK_DEFAULT_CHANNEL이 설정되지 않았습니다.");
+
+    const mainMsg = await slack.chat.postMessage({
+      channel: mainCh,
+      text: [
+        `${emoji} *[${team.id}]* ${icon} *${sender}*${trackStr} — ${label}`,
+        summary,
+      ].join("\n"),
+      mrkdwn: true,
+    });
+
+    // 2) 팀 채널에도 게시 (에이전트 identity 사용)
+    const identity = agentIdentity(sender, member);
+    const teamMsg = await slack.chat.postMessage({
+      channel: team.channelId,
+      text: `${emoji} *${label}*\n${summary}`,
+      mrkdwn: true,
+      username: identity.username,
+      icon_emoji: identity.icon_emoji,
+    });
+
+    // 3) 상세 내용은 팀 채널 스레드에
+    if (details) {
+      await sendSmart(team.channelId, details, {
+        thread_ts: teamMsg.ts,
+        title: `${sender} 상세 보고`,
+        filename: `report-${sender}-${Date.now()}.txt`,
+      });
+    }
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              ok: true,
+              team_id,
+              sender,
+              status,
+              main_channel_ts: mainMsg.ts,
+              team_channel_ts: teamMsg.ts,
+              message: `${label} 보고 완료 (메인 채널 + 팀 채널)`,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+);
+
+// ── Tool: slack_request_approval ───────────────────────────────
+
+server.tool(
+  "slack_request_approval",
+  "사용자에게 승인을 요청하고 응답을 대기합니다. 문제 발생, 중요 결정, 위험한 작업 전에 사용자 확인이 필요할 때 호출합니다. 메인 채널에 승인 요청을 게시하고 사용자가 ✅(승인) 또는 ❌(거부) 리액션이나 텍스트로 응답할 때까지 대기합니다.",
+  {
+    title: z.string().describe("승인 요청 제목 (예: DB 마이그레이션 실행, 프로덕션 배포)"),
+    description: z.string().describe("승인이 필요한 이유와 상세 설명"),
+    team_id: z
+      .string()
+      .optional()
+      .describe("팀 식별자 (팀 컨텍스트에서 요청 시)"),
+    sender: z
+      .string()
+      .optional()
+      .describe("요청하는 멤버 ID (팀 컨텍스트)"),
+    options: z
+      .array(z.string())
+      .optional()
+      .describe("선택지 목록 (예: ['옵션A: 롤백', '옵션B: 계속 진행', '옵션C: 중단']). 미지정 시 승인/거부만."),
+    channel: z
+      .string()
+      .optional()
+      .describe("승인 요청을 보낼 채널 (미지정 시 메인 채널)"),
+    timeout_seconds: z
+      .number()
+      .min(30)
+      .max(600)
+      .default(300)
+      .describe("응답 대기 시간 (초). 기본 300초(5분)."),
+    poll_interval_seconds: z
+      .number()
+      .min(2)
+      .max(30)
+      .default(5)
+      .describe("폴링 간격 (초). 기본 5초."),
+  },
+  async ({ title, description, team_id, sender, options, channel, timeout_seconds, poll_interval_seconds }) => {
+    const ch = channel || SLACK_DEFAULT_CHANNEL;
+    if (!ch) throw new Error("채널이 지정되지 않았습니다.");
+
+    const myUserId = await resolveBotUserId();
+
+    // 팀 컨텍스트 정보
+    let teamContext = "";
+    if (team_id && sender) {
+      const team = teams.get(team_id);
+      const member = team?.members.get(sender);
+      const icon = member ? getRoleIcon(member.role) : "🤖";
+      const trackStr = member?.track ? ` [${member.track}]` : "";
+      teamContext = `\n요청자: ${icon} *${sender}*${trackStr} (팀 *${team_id}*)`;
+    }
+
+    // 선택지 포맷
+    let optionsText = "";
+    if (options && options.length > 0) {
+      optionsText = "\n\n*선택지:*\n" + options.map((o, i) => `${i + 1}️⃣ ${o}`).join("\n");
+      optionsText += "\n\n_번호 또는 텍스트로 응답해주세요._";
+    } else {
+      optionsText = "\n\n✅ 승인 | ❌ 거부\n_리액션 또는 텍스트(승인/거부)로 응답해주세요._";
+    }
+
+    // 승인 요청 메시지 게시
+    const approvalMsg = await slack.chat.postMessage({
+      channel: ch,
+      text: [
+        `🔔 *[승인 요청]* ${title}`,
+        teamContext,
+        "",
+        description,
+        optionsText,
+        "",
+        `⏳ _${timeout_seconds}초 후 타임아웃_`,
+      ].filter(Boolean).join("\n"),
+      mrkdwn: true,
+    });
+
+    const approvalTs = approvalMsg.ts!;
+
+    // 팀 채널에도 알림
+    if (team_id) {
+      const team = teams.get(team_id);
+      if (team) {
+        await slack.chat.postMessage({
+          channel: team.channelId,
+          text: `🔔 *승인 대기 중* — ${title}\n메인 채널에서 사용자 응답 대기 중...`,
+          mrkdwn: true,
+        });
+      }
+    }
+
+    // 폴링: 리액션 또는 스레드 답장 확인
+    const deadline = Date.now() + timeout_seconds * 1000;
+    const interval = poll_interval_seconds * 1000;
+
+    while (Date.now() < deadline) {
+      await sleep(interval);
+
+      // 1) 리액션 확인
+      try {
+        const reactResult = await slack.reactions.get({
+          channel: ch,
+          timestamp: approvalTs,
+          full: true,
+        });
+
+        const reactions = (reactResult.message as { reactions?: Array<{ name: string; users?: string[] }> })?.reactions || [];
+        for (const r of reactions) {
+          const nonBotUsers = (r.users || []).filter((u) => u !== myUserId);
+          if (nonBotUsers.length === 0) continue;
+
+          if (["white_check_mark", "+1", "heavy_check_mark", "thumbsup"].includes(r.name)) {
+            // 승인 확인 리액션
+            await slack.reactions.add({ channel: ch, name: "white_check_mark", timestamp: approvalTs }).catch(() => {});
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(
+                    {
+                      ok: true,
+                      approved: true,
+                      method: "reaction",
+                      reaction: r.name,
+                      user: nonBotUsers[0],
+                      approval_ts: approvalTs,
+                      message: `✅ 승인됨 (:${r.name}: 리액션)`,
+                    },
+                    null,
+                    2
+                  ),
+                },
+              ],
+            };
+          }
+
+          if (["x", "-1", "no_entry", "thumbsdown", "no_entry_sign"].includes(r.name)) {
+            await slack.reactions.add({ channel: ch, name: "x", timestamp: approvalTs }).catch(() => {});
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(
+                    {
+                      ok: true,
+                      approved: false,
+                      method: "reaction",
+                      reaction: r.name,
+                      user: nonBotUsers[0],
+                      approval_ts: approvalTs,
+                      message: `❌ 거부됨 (:${r.name}: 리액션)`,
+                    },
+                    null,
+                    2
+                  ),
+                },
+              ],
+            };
+          }
+        }
+      } catch {
+        // reactions.get 실패 시 무시하고 텍스트 확인으로 계속
+      }
+
+      // 2) 스레드 텍스트 답장 확인
+      try {
+        const threadResult = await slack.conversations.replies({
+          channel: ch,
+          ts: approvalTs,
+          oldest: approvalTs,
+          limit: 10,
+        });
+
+        const replies = ((threadResult.messages || []) as SlackMessage[])
+          .filter((m) => m.ts !== approvalTs && m.user !== myUserId);
+
+        if (replies.length > 0) {
+          const latest = replies[replies.length - 1];
+          const text = (latest.text || "").toLowerCase().trim();
+
+          // 승인/거부 텍스트 패턴 매칭
+          const approvePatterns = ["승인", "확인", "진행", "ㅇㅇ", "ㄱㄱ", "ok", "yes", "approve", "approved", "lgtm", "go", "proceed"];
+          const denyPatterns = ["거부", "거절", "중단", "취소", "ㄴㄴ", "no", "deny", "denied", "reject", "stop", "cancel", "abort"];
+
+          const isApproved = approvePatterns.some((p) => text.includes(p));
+          const isDenied = denyPatterns.some((p) => text.includes(p));
+
+          if (isApproved || isDenied) {
+            const emoji = isApproved ? "white_check_mark" : "x";
+            await slack.reactions.add({ channel: ch, name: emoji, timestamp: approvalTs }).catch(() => {});
+
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(
+                    {
+                      ok: true,
+                      approved: isApproved,
+                      method: "text",
+                      reply_text: latest.text,
+                      user: latest.user,
+                      reply_ts: latest.ts,
+                      approval_ts: approvalTs,
+                      message: isApproved ? "✅ 승인됨 (텍스트 응답)" : "❌ 거부됨 (텍스트 응답)",
+                    },
+                    null,
+                    2
+                  ),
+                },
+              ],
+            };
+          }
+
+          // 선택지 응답 (숫자 또는 텍스트)
+          if (options && options.length > 0) {
+            const numMatch = text.match(/^(\d+)/);
+            const selectedIdx = numMatch ? parseInt(numMatch[1], 10) - 1 : -1;
+            const selectedOption = selectedIdx >= 0 && selectedIdx < options.length
+              ? options[selectedIdx]
+              : latest.text;
+
+            await slack.reactions.add({ channel: ch, name: "white_check_mark", timestamp: approvalTs }).catch(() => {});
+
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(
+                    {
+                      ok: true,
+                      approved: true,
+                      method: "choice",
+                      selected_option: selectedOption,
+                      selected_index: selectedIdx >= 0 ? selectedIdx : null,
+                      reply_text: latest.text,
+                      user: latest.user,
+                      reply_ts: latest.ts,
+                      approval_ts: approvalTs,
+                      message: `선택됨: ${selectedOption}`,
+                    },
+                    null,
+                    2
+                  ),
+                },
+              ],
+            };
+          }
+        }
+      } catch {
+        // replies 조회 실패 시 다음 폴링으로
+      }
+    }
+
+    // 타임아웃
+    await slack.reactions.add({ channel: ch, name: "hourglass", timestamp: approvalTs }).catch(() => {});
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              ok: false,
+              approved: null,
+              reason: "timeout",
+              timeout_seconds,
+              approval_ts: approvalTs,
+              message: `⏰ ${timeout_seconds}초 동안 응답 없음. 작업을 중단하거나 다시 요청하세요.`,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+);
+
+// ── Tool: slack_cost_report ─────────────────────────────────────
+
+server.tool(
+  "slack_cost_report",
+  "현재 세션의 토큰 사용량과 비용을 Slack에 보고합니다. 에이전트가 정기적으로 호출하여 사용자에게 비용 가시성을 제공합니다. 작업 중간중간 또는 command_loop 사이사이에 호출하면 됩니다.",
+  {
+    input_tokens: z.number().describe("입력 토큰 수"),
+    output_tokens: z.number().describe("출력 토큰 수"),
+    cache_read_tokens: z.number().default(0).describe("캐시 읽기 토큰 수"),
+    cache_write_tokens: z.number().default(0).describe("캐시 쓰기 토큰 수"),
+    total_cost_usd: z.number().optional().describe("총 비용 (USD). 미지정 시 토큰 수로 추정"),
+    session_id: z.string().optional().describe("세션 식별자 (compact 추적용)"),
+    task_summary: z.string().optional().describe("현재 수행 중인 작업 요약"),
+    channel: z.string().optional().describe("보고할 채널 (미지정 시 메인 채널)"),
+    team_id: z.string().optional().describe("팀 식별자 (팀 채널에도 보고 시)"),
+    sender: z.string().optional().describe("보고하는 팀 멤버 ID"),
+  },
+  async ({ input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_cost_usd, session_id, task_summary, channel, team_id, sender }) => {
+    const ch = channel || SLACK_DEFAULT_CHANNEL;
+    if (!ch) throw new Error("채널이 지정되지 않았습니다.");
+
+    // Sonnet pricing (per 1M tokens) — 2025 기준
+    const PRICE_INPUT = 3.0;     // $3/1M input tokens
+    const PRICE_OUTPUT = 15.0;   // $15/1M output tokens
+    const PRICE_CACHE_READ = 0.30;  // $0.30/1M cache read
+    const PRICE_CACHE_WRITE = 3.75; // $3.75/1M cache write
+
+    const estimatedCost = total_cost_usd ?? (
+      (input_tokens * PRICE_INPUT / 1_000_000) +
+      (output_tokens * PRICE_OUTPUT / 1_000_000) +
+      (cache_read_tokens * PRICE_CACHE_READ / 1_000_000) +
+      (cache_write_tokens * PRICE_CACHE_WRITE / 1_000_000)
+    );
+
+    const totalTokens = input_tokens + output_tokens + cache_read_tokens + cache_write_tokens;
+
+    // 비용 레벨 이모지
+    let costEmoji = "💰";
+    if (estimatedCost < 0.10) costEmoji = "🟢";
+    else if (estimatedCost < 0.50) costEmoji = "🟡";
+    else if (estimatedCost < 1.00) costEmoji = "🟠";
+    else costEmoji = "🔴";
+
+    const formatNum = (n: number) => n.toLocaleString();
+    const formatUsd = (n: number) => `$${n.toFixed(4)}`;
+
+    const lines = [
+      `${costEmoji} *토큰 비용 리포트*`,
+      "",
+      `*총 비용:* ${formatUsd(estimatedCost)}${total_cost_usd ? "" : " (추정)"}`,
+      `*총 토큰:* ${formatNum(totalTokens)}`,
+      "",
+      `📥 입력: ${formatNum(input_tokens)} (${formatUsd(input_tokens * PRICE_INPUT / 1_000_000)})`,
+      `📤 출력: ${formatNum(output_tokens)} (${formatUsd(output_tokens * PRICE_OUTPUT / 1_000_000)})`,
+    ];
+
+    if (cache_read_tokens > 0) {
+      lines.push(`📋 캐시 읽기: ${formatNum(cache_read_tokens)} (${formatUsd(cache_read_tokens * PRICE_CACHE_READ / 1_000_000)})`);
+    }
+    if (cache_write_tokens > 0) {
+      lines.push(`📝 캐시 쓰기: ${formatNum(cache_write_tokens)} (${formatUsd(cache_write_tokens * PRICE_CACHE_WRITE / 1_000_000)})`);
+    }
+
+    if (task_summary) {
+      lines.push("", `📋 *작업:* ${task_summary}`);
+    }
+    if (session_id) {
+      lines.push(`🔑 세션: \`${session_id}\``);
+    }
+
+    lines.push("", `_${new Date().toLocaleString("ko-KR", { timeZone: "Asia/Seoul" })}_`);
+
+    const text = lines.join("\n");
+
+    // 메인 채널에 게시
+    const mainMsg = await slack.chat.postMessage({
+      channel: ch,
+      text,
+      mrkdwn: true,
+    });
+
+    // 팀 채널에도 게시 (선택)
+    if (team_id && sender) {
+      const team = teams.get(team_id);
+      if (team) {
+        const member = team.members.get(sender);
+        const identity = member
+          ? agentIdentity(sender, member)
+          : { username: sender, icon_emoji: ":moneybag:" };
+
+        await slack.chat.postMessage({
+          channel: team.channelId,
+          text: `${costEmoji} 비용: ${formatUsd(estimatedCost)} | 토큰: ${formatNum(totalTokens)}`,
+          mrkdwn: true,
+          username: identity.username,
+          icon_emoji: identity.icon_emoji,
+        });
+      }
+    }
+
+    // 비용 상태를 state에 기록
+    const state = loadState() || { teams: {}, updated_at: "" };
+    const stateAny = state as unknown as Record<string, unknown>;
+    const costHistory = (stateAny.cost_reports as Array<Record<string, unknown>>) || [];
+    costHistory.push({
+      timestamp: new Date().toISOString(),
+      input_tokens,
+      output_tokens,
+      cache_read_tokens,
+      cache_write_tokens,
+      estimated_cost_usd: estimatedCost,
+      session_id,
+    });
+    // 최근 50개만 유지
+    if (costHistory.length > 50) costHistory.splice(0, costHistory.length - 50);
+    stateAny.cost_reports = costHistory;
+    saveState(state);
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              ok: true,
+              estimated_cost_usd: estimatedCost,
+              total_tokens: totalTokens,
+              channel: ch,
+              ts: mainMsg.ts,
+              message: `비용 리포트 전송 완료: ${formatUsd(estimatedCost)}`,
             },
             null,
             2
