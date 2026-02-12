@@ -12,6 +12,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 
 import { resolveBotUserId, getBotUserId } from "./slack-client.js";
 import { restoreTeamsFromState } from "./state.js";
+import { startBackgroundPoller } from "./background-poller.js";
 
 // Tool registrations
 import { registerBasicTools } from "./tools/basic.js";
@@ -57,6 +58,9 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("🚀 Slack MCP Server running on stdio");
+
+  // Start background message collector (runs independently of tool calls)
+  startBackgroundPoller();
 }
 
 main().catch((err) => {

@@ -18,6 +18,7 @@ import {
 import { getTeam, getRoleIcon } from "../state.js";
 import { slack } from "../slack-client.js";
 import { agentIdentity } from "../state.js";
+import { getTeamWorkflowInstructions } from "../formatting.js";
 
 export function registerContextTools(server: McpServer): void {
 
@@ -112,6 +113,13 @@ export function registerContextTools(server: McpServer): void {
             message: blockedBy.length > 0
               ? `태스크 ${task_id} 생성됨 (선행 태스크 대기 중)`
               : `태스크 ${task_id}이(가) ${assigned_to}에게 할당됨`,
+            workflow_for_assignee: getTeamWorkflowInstructions({
+              agentId: assigned_to,
+              teamId: team_id,
+              channelId: team.channelId,
+              taskId: task_id,
+              taskTitle: title,
+            }),
           }, null, 2),
         }],
       };
@@ -193,6 +201,11 @@ export function registerContextTools(server: McpServer): void {
             result_summary: result_summary || null,
             unblocked: unblocked.length > 0 ? unblocked : undefined,
             message: `태스크 ${task_id} → ${status}`,
+            next_action: status === "done"
+              ? `⚠️ 작업 완료! 반드시 slack_team_report(team_id="${team_id}", sender="${sender || task.assigned_to}", summary="${(result_summary || "").substring(0, 50)}...", status="done")를 호출하여 메인 채널에 보고하세요.`
+              : status === "blocked"
+              ? `⚠️ 차단됨! slack_team_send로 리더에게 차단 사유를 알리세요.`
+              : undefined,
           }, null, 2),
         }],
       };
@@ -377,6 +390,19 @@ export function registerContextTools(server: McpServer): void {
           at: d.created_at,
         }));
       }
+
+      // Find current or next pending task for instructions
+      const currentTask = myTasks.find((t) => t.status === "in-progress")
+        || myTasks.find((t) => t.status === "assigned")
+        || myTasks.find((t) => t.status === "pending");
+
+      recovery.workflow = getTeamWorkflowInstructions({
+        agentId: agent_id,
+        teamId: team_id,
+        channelId: team.channelId,
+        taskId: currentTask?.id,
+        taskTitle: currentTask?.title,
+      });
 
       return {
         content: [{ type: "text", text: JSON.stringify(recovery, null, 2) }],

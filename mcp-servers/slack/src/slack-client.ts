@@ -4,6 +4,7 @@
 
 import { WebClient } from "@slack/web-api";
 import { SLACK_BOT_TOKEN, SLACK_MSG_LIMIT, SLACK_FILE_THRESHOLD } from "./types.js";
+import { addWatchedThread } from "./db.js";
 
 // ── Client Initialization ──────────────────────────────────────
 
@@ -58,7 +59,10 @@ export async function sendSmart(
       thread_ts: options?.thread_ts,
       mrkdwn: true,
     });
-    return { ts: result.ts || "", method: "message" };
+    const ts = result.ts || "";
+    // Track this message for thread reply monitoring
+    if (ts) addWatchedThread(channel, options?.thread_ts || ts, "sendSmart:message");
+    return { ts, method: "message" };
   }
 
   if (len <= SLACK_FILE_THRESHOLD) {
@@ -74,6 +78,8 @@ export async function sendSmart(
       });
       if (i === 0) firstTs = result.ts || "";
     }
+    // Track the first chunk for thread monitoring
+    if (firstTs) addWatchedThread(channel, options?.thread_ts || firstTs, "sendSmart:chunked");
     return { ts: firstTs, method: "chunked", chunks: chunks.length };
   }
 
@@ -84,6 +90,10 @@ export async function sendSmart(
     title,
     thread_ts: options?.thread_ts,
   });
+  // Track for thread monitoring
+  if (uploadResult.ts || options?.thread_ts) {
+    addWatchedThread(channel, options?.thread_ts || uploadResult.ts, "sendSmart:file");
+  }
   return { ts: uploadResult.ts, method: "file" };
 }
 

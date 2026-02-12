@@ -2,11 +2,17 @@
  * Shared type definitions for the Slack MCP Server.
  */
 
-import { resolve } from "path";
+import { resolve, dirname } from "path";
+import { fileURLToPath } from "url";
 
 // ── Paths & Constants ──────────────────────────────────────────
 
-export const STATE_DIR = resolve(process.cwd(), ".claude", "mcp-servers", "slack");
+// Use __dirname-based resolution so paths are stable regardless of how the
+// process is launched (direct, wrapper, different cwd, etc.).
+// src/ lives inside the slack MCP server directory → dirname(__dirname) = slack root
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+export const STATE_DIR = resolve(__dirname, "..");          // .claude/mcp-servers/slack/
 export const STATE_FILE = resolve(STATE_DIR, "state.json");
 export const DB_FILE = resolve(STATE_DIR, "slack_mcp.db");
 export const DOWNLOAD_DIR = resolve(STATE_DIR, "downloads");

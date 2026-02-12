@@ -79,8 +79,8 @@ export function enrichMessage(
     mentions: mentions.length > 0 ? mentions : undefined,
     files,
     reply_to: isThread
-      ? { method: "slack_reply_thread" as const, thread_ts: msg.thread_ts!, channel: ch }
-      : { method: "slack_send_message" as const, channel: ch },
+      ? { method: "slack_respond" as const, thread_ts: msg.thread_ts!, channel: ch }
+      : { method: "slack_respond" as const, channel: ch },
   };
 }
 
@@ -89,16 +89,53 @@ export function getWorkflowInstructions(unreadCount: number, hasMentions: boolea
   const instructions: string[] = [];
   instructions.push(
     "[WORKFLOW]",
-    "1. reply_to 필드를 확인 → type=thread_reply면 slack_reply_thread, type=channel_message면 slack_send_message 사용",
+    "1. reply_to 필드를 slack_respond()에 그대로 전달 → 스레드/채널 자동 라우팅",
     "2. mentions 필드가 있으면 해당 팀원에게 slack_team_send(mention=[...])로 전달",
     "3. files 필드가 있으면 slack_download_file(file_id)로 다운로드 후 처리",
     "4. 작업 완료 후 slack_command_loop()로 다음 명령 대기",
     "5. 긴 작업 중에는 slack_check_inbox()로 중간에 미읽 메시지 확인",
+    "6. reply_mode: auto(기본)=thread_ts 유무로 자동결정, thread=강제 스레드, channel=강제 채널",
   );
   if (hasMentions) {
-    instructions.push("6. @멘션된 팀원에게 작업을 위임하거나 결과를 전달하세요");
+    instructions.push("7. @멘션된 팀원에게 작업을 위임하거나 결과를 전달하세요");
   }
   return instructions;
+}
+
+/** 팀원 에이전트가 따라야 할 작업/보고 워크플로우 지시사항 */
+export function getTeamWorkflowInstructions(context: {
+  agentId: string;
+  teamId: string;
+  channelId: string;
+  taskId?: string;
+  taskTitle?: string;
+}): string[] {
+  const { agentId, teamId, channelId, taskId, taskTitle } = context;
+  return [
+    "[TEAM WORKFLOW — 반드시 따르세요]",
+    `팀: ${teamId} | 에이전트: ${agentId} | 채널: ${channelId}`,
+    "",
+    "■ 작업 시작 시:",
+    `  slack_team_update_task(team_id="${teamId}", task_id="${taskId || "?"}", status="in-progress")`,
+    `  slack_team_send(team_id="${teamId}", sender="${agentId}", message="작업 시작: ${taskTitle || "..."}")`,
+    "",
+    "■ 중간 진행 보고 (긴 작업 시 주기적으로):",
+    `  slack_team_send(team_id="${teamId}", sender="${agentId}", message="진행 상황 요약...")`,
+    "",
+    "■ 작업 완료 시 (반드시):",
+    `  slack_team_update_task(team_id="${teamId}", task_id="${taskId || "?"}", status="done", result_summary="결과 요약")`,
+    `  slack_team_report(team_id="${teamId}", sender="${agentId}", summary="결과 요약", status="done")`,
+    "",
+    "■ 문제/차단 발생 시:",
+    `  slack_team_update_task(team_id="${teamId}", task_id="${taskId || "?"}", status="blocked")`,
+    `  slack_team_send(team_id="${teamId}", sender="${agentId}", message="차단: 이유 설명")`,
+    "",
+    "■ 리더 응답 대기 시:",
+    `  slack_team_wait(team_id="${teamId}", wait_for_sender="lead", timeout_seconds=60)`,
+    "",
+    "⚠️ 팀 채널에 보고하지 않으면 다른 팀원과 사용자가 진행 상황을 알 수 없습니다.",
+    "⚠️ 작업 완료 후 반드시 slack_team_report로 메인 채널에도 보고하세요.",
+  ];
 }
 
 // ── Rich Slack Formatting ──────────────────────────────────────

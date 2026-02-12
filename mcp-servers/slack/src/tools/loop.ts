@@ -8,11 +8,13 @@ import type { SlackMessage } from "../types.js";
 import { resolveChannel } from "../state.js";
 import { saveState } from "../state.js";
 import { slack, resolveBotUserId, sleep } from "../slack-client.js";
-import { formatMessages, enrichMessage, getWorkflowInstructions, findTeamMentions } from "../formatting.js";
+import { enrichMessage, getWorkflowInstructions, findTeamMentions } from "../formatting.js";
 import {
   inboxIngest, inboxGetUnread, inboxMarkAllRead,
   getChannelCursor, setChannelCursor,
+  addWatchedThread,
 } from "../db.js";
+import { pollNow } from "../background-poller.js";
 
 export function registerLoopTools(server: McpServer): void {
 
@@ -20,39 +22,36 @@ export function registerLoopTools(server: McpServer): void {
 
   server.tool(
     "slack_check_inbox",
-    "SQLite 인박스에서 미읽 메시지를 확인합니다. Slack API에서 새 메시지를 가져와 인박스에 저장한 후, unread 메시지만 반환합니다. mark_as_read=true면 읽은 메시지는 인박스에서 제거('read' 상태로 전환)됩니다.",
+    "SQLite 인박스에서 미읽 메시지를 확인합니다. 백그라운드 폴러가 10초마다 자동 수집하므로, 대부분의 메시지는 이미 인박스에 있습니다. fresh=true로 즉시 최신 Slack API 데이터를 가져올 수도 있습니다.",
     {
       channel: z.string().optional().describe("채널 ID (미지정 시 기본 채널)"),
       mark_as_read: z.boolean().default(true).describe("true: 읽은 후 인박스에서 제거. false: peek 모드 (남겨둠)"),
       include_bot: z.boolean().default(false).describe("봇 메시지도 포함할지 여부"),
       agent_id: z.string().default("main").describe("읽는 에이전트 식별자 (read_by에 기록)"),
+      fresh: z.boolean().default(false).describe("true: 즉시 Slack API에서 최신 메시지를 가져온 후 인박스 확인. false(기본): 백그라운드 폴러가 수집한 인박스만 확인 (빠름)."),
     },
-    async ({ channel, mark_as_read, include_bot, agent_id }) => {
+    async ({ channel, mark_as_read, include_bot, agent_id, fresh }) => {
       const ch = resolveChannel(channel);
       const myUserId = await resolveBotUserId();
-      const cursor = getChannelCursor(ch);
 
-      const result = await slack.conversations.history({
-        channel: ch,
-        limit: 50,
-        ...(cursor ? { oldest: cursor } : {}),
-      });
-
-      let messages = (result.messages || []) as SlackMessage[];
-      if (cursor) messages = messages.filter((m) => m.ts !== cursor);
-      if (!include_bot) messages = messages.filter((m) => m.user !== myUserId);
-
-      if (messages.length > 0) {
-        inboxIngest(ch, messages);
-        const latestTs = messages.reduce((max, m) => m.ts > max ? m.ts : max, messages[0].ts);
-        setChannelCursor(ch, latestTs);
+      // Fresh fetch if requested — triggers background poller immediately
+      if (fresh) {
+        await pollNow();
       }
 
-      const unread = inboxGetUnread(ch);
+      // Read from SQLite inbox (already populated by background poller)
+      let unread = inboxGetUnread(ch);
+
+      // Filter out bot messages if not wanted
+      if (!include_bot) {
+        unread = unread.filter((r) => r.user_id !== myUserId);
+      }
 
       if (mark_as_read && unread.length > 0) {
         inboxMarkAllRead(ch, agent_id);
       }
+
+      const cursor = getChannelCursor(ch);
 
       return {
         content: [{
@@ -61,6 +60,7 @@ export function registerLoopTools(server: McpServer): void {
             unread_count: unread.length,
             channel: ch,
             cursor_ts: cursor || "(none - first read)",
+            source: fresh ? "fresh_fetch" : "background_poller",
             messages: unread.map((r) => ({
               text: r.text,
               user: r.user_id,
@@ -68,12 +68,12 @@ export function registerLoopTools(server: McpServer): void {
               thread_ts: r.thread_ts,
               type: r.thread_ts ? "thread_reply" : "channel_message",
               reply_to: r.thread_ts
-                ? { method: "slack_reply_thread", thread_ts: r.thread_ts, channel: ch }
-                : { method: "slack_send_message", channel: ch },
+                ? { method: "slack_respond" as const, thread_ts: r.thread_ts, channel: ch }
+                : { method: "slack_respond" as const, channel: ch },
             })),
             hint: unread.length > 0
               ? `미읽 메시지 ${unread.length}건. ${mark_as_read ? "인박스에서 제거됨." : "peek 모드 — 인박스에 남아있음."}`
-              : "미읽 메시지가 없습니다.",
+              : "미읽 메시지가 없습니다. (백그라운드 폴러가 10초마다 수집 중)",
           }, null, 2),
         }],
       };
@@ -91,10 +91,18 @@ export function registerLoopTools(server: McpServer): void {
       poll_interval_seconds: z.number().min(2).max(30).default(3).describe("폴링 간격 (초). 기본 3초."),
       since_ts: z.string().optional().describe("이 타임스탬프 이후의 메시지만 감지. 미지정 시 채널 읽기 커서를 자동 사용 (권장)."),
       greeting: z.string().optional().describe("대기 시작 시 채널에 보낼 메시지 (예: '✅ 이전 작업 완료. 다음 명령을 기다립니다.')"),
+      watch_threads: z.array(z.string()).optional().describe("감시할 스레드 ts 목록. 이 스레드에 새 답장이 달리면 명령으로 인식. 미지정 시 봇의 최근 메시지 스레드를 자동 감시."),
     },
-    async ({ channel, timeout_seconds, poll_interval_seconds, since_ts, greeting }) => {
+    async ({ channel, timeout_seconds, poll_interval_seconds, since_ts, greeting, watch_threads }) => {
       const ch = resolveChannel(channel);
       const myUserId = await resolveBotUserId();
+
+      // Register explicit watch_threads into SQLite for background poller
+      if (watch_threads) {
+        for (const ts of watch_threads) {
+          addWatchedThread(ch, ts, "command_loop:explicit");
+        }
+      }
 
       if (greeting) {
         const greetMsg = await slack.chat.postMessage({
@@ -102,10 +110,16 @@ export function registerLoopTools(server: McpServer): void {
           text: greeting,
           mrkdwn: true,
         });
-        if (greetMsg.ts) setChannelCursor(ch, greetMsg.ts);
+        if (greetMsg.ts) {
+          setChannelCursor(ch, greetMsg.ts);
+          addWatchedThread(ch, greetMsg.ts, "command_loop:greeting");
+        }
       }
 
-      const baseTs = since_ts || getChannelCursor(ch) || String(Math.floor(Date.now() / 1000)) + ".000000";
+      if (since_ts) {
+        setChannelCursor(ch, since_ts);
+      }
+
       const deadline = Date.now() + timeout_seconds * 1000;
       const interval = poll_interval_seconds * 1000;
 
@@ -145,62 +159,55 @@ export function registerLoopTools(server: McpServer): void {
         };
       }
 
-      // Polling loop
+      // Polling loop — SQLite-first: background poller가 10초마다 수집한 데이터를 읽음
       while (Date.now() < deadline) {
-        try {
-          const result = await slack.conversations.history({
-            channel: ch,
-            oldest: baseTs,
-            limit: 20,
+        // 백그라운드 폴러의 최신 데이터를 즉시 반영
+        await pollNow();
+
+        // SQLite inbox에서 미읽 메시지 확인
+        let unread = inboxGetUnread(ch);
+        unread = unread.filter((r) => r.user_id !== myUserId);
+
+        if (unread.length > 0) {
+          inboxMarkAllRead(ch, "command_loop");
+
+          const latest = unread[unread.length - 1];
+          setChannelCursor(ch, latest.message_ts);
+
+          try {
+            await slack.reactions.add({ channel: ch, name: "eyes", timestamp: latest.message_ts });
+          } catch { /* already reacted */ }
+
+          saveState({
+            loop: {
+              active: true,
+              channel: ch,
+              last_ts: latest.message_ts,
+              started_at: new Date().toISOString(),
+            },
           });
 
-          const messages = (result.messages || []) as SlackMessage[];
-          const userMessages = messages.filter((m) => m.user !== myUserId && m.ts !== baseTs);
+          const sorted = unread.map((r) => ({
+            text: r.text,
+            user: r.user_id,
+            ts: r.message_ts,
+            thread_ts: r.thread_ts,
+          } as SlackMessage));
 
-          if (userMessages.length > 0) {
-            inboxIngest(ch, userMessages);
-            inboxMarkAllRead(ch, "command_loop");
-
-            const sorted = [...userMessages].reverse();
-            const latest = sorted[sorted.length - 1];
-
-            setChannelCursor(ch, latest.ts);
-
-            try {
-              await slack.reactions.add({ channel: ch, name: "eyes", timestamp: latest.ts });
-            } catch { /* already reacted */ }
-
-            saveState({
-              loop: {
-                active: true,
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                command_received: true,
+                ...enrichMessage(sorted[sorted.length - 1], ch),
                 channel: ch,
-                last_ts: latest.ts,
-                started_at: new Date().toISOString(),
-              },
-            });
-
-            return {
-              content: [{
-                type: "text",
-                text: JSON.stringify({
-                  command_received: true,
-                  ...enrichMessage(latest, ch),
-                  channel: ch,
-                  all_messages: sorted.map((m) => enrichMessage(m, ch)),
-                  unread_count: sorted.length,
-                  workflow: getWorkflowInstructions(sorted.length,
-                    sorted.some((m) => findTeamMentions(m.text).length > 0)),
-                }, null, 2),
-              }],
-            };
-          }
-        } catch (err) {
-          const errMsg = err instanceof Error ? err.message : String(err);
-          if (errMsg.includes("rate_limited")) {
-            await sleep(10000);
-            continue;
-          }
-          throw err;
+                all_messages: sorted.map((m) => enrichMessage(m, ch)),
+                unread_count: sorted.length,
+                workflow: getWorkflowInstructions(sorted.length,
+                  sorted.some((m) => findTeamMentions(m.text).length > 0)),
+              }, null, 2),
+            }],
+          };
         }
 
         await sleep(interval);
@@ -268,10 +275,21 @@ export function registerLoopTools(server: McpServer): void {
 
           if (userMessages.length > 0) {
             const sorted = [...userMessages].reverse();
+            // Ingest into inbox for reliable tracking
+            inboxIngest(ch, sorted);
+            inboxMarkAllRead(ch, "wait_for_reply");
+            const latestTs = sorted[sorted.length - 1].ts;
+            setChannelCursor(ch, latestTs);
+
             return {
               content: [{
                 type: "text",
-                text: `✅ 새 메시지 ${sorted.length}건 수신:\n\n${formatMessages(sorted)}`,
+                text: JSON.stringify({
+                  received: true,
+                  count: sorted.length,
+                  messages: sorted.map((m) => enrichMessage(m, ch)),
+                  channel: ch,
+                }, null, 2),
               }],
             };
           }

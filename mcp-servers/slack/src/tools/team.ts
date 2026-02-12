@@ -13,7 +13,7 @@ import {
   saveTeamsToState, teamNameSafe,
 } from "../state.js";
 import { slack, resolveBotUserId, sendSmart, sleep } from "../slack-client.js";
-import { formatMessages } from "../formatting.js";
+import { formatMessages, getTeamWorkflowInstructions } from "../formatting.js";
 
 export function registerTeamTools(server: McpServer): void {
 
@@ -125,6 +125,7 @@ export function registerTeamTools(server: McpServer): void {
             root_thread_ts: introMsg.ts,
             members_count: members.length,
             message: `팀 채널 #${chName} 생성 완료`,
+            member_workflow_hint: "각 팀원 에이전트에게 아래 지시를 전달하세요: 작업 진행/완료 시 반드시 slack_team_send 또는 slack_team_report를 호출하여 팀 채널에 보고할 것.",
           }, null, 2),
         }],
       };
@@ -188,6 +189,11 @@ export function registerTeamTools(server: McpServer): void {
             channel_id: team.channelId,
             total_members: team.members.size,
             message: `${member_id} 팀 합류 완료`,
+            workflow: getTeamWorkflowInstructions({
+              agentId: member_id,
+              teamId: team_id,
+              channelId: team.channelId,
+            }),
           }, null, 2),
         }],
       };
@@ -363,7 +369,11 @@ export function registerTeamTools(server: McpServer): void {
       }
 
       return {
-        content: [{ type: "text", text: formatMessages(filtered) }],
+        content: [{
+          type: "text",
+          text: formatMessages(filtered)
+            + "\n\n[HINT] 작업 완료 시 반드시 slack_team_send/slack_team_report로 팀 채널에 보고하세요.",
+        }],
       };
     }
   );
@@ -435,6 +445,7 @@ export function registerTeamTools(server: McpServer): void {
                   text: m.text,
                   thread_ts: m.thread_ts,
                 })),
+                hint: "⚠️ 지시를 수행한 후 반드시 slack_team_send 또는 slack_team_report로 결과를 팀 채널에 보고하세요.",
               }, null, 2),
             }],
           };

@@ -102,6 +102,16 @@ db.exec(`
     created_at      TEXT    NOT NULL DEFAULT (datetime('now'))
   );
   CREATE INDEX IF NOT EXISTS idx_decisions_team ON team_decisions(team_id);
+
+  -- Watched threads: bot-sent messages to monitor for user replies
+  CREATE TABLE IF NOT EXISTS watched_threads (
+    channel_id  TEXT NOT NULL,
+    thread_ts   TEXT NOT NULL,
+    context     TEXT,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (channel_id, thread_ts)
+  );
+  CREATE INDEX IF NOT EXISTS idx_watched_created ON watched_threads(created_at);
 `);
 
 // ── Prepared Statements ────────────────────────────────────────
@@ -191,6 +201,24 @@ export const stmts: Record<string, Statement> = {
   decisionsByTeam: db.prepare(`SELECT * FROM team_decisions WHERE team_id = ? ORDER BY created_at ASC`),
   decisionsByType: db.prepare(`SELECT * FROM team_decisions WHERE team_id = ? AND decision_type = ? ORDER BY created_at ASC`),
   decisionRecent: db.prepare(`SELECT * FROM team_decisions WHERE team_id = ? ORDER BY created_at DESC LIMIT ?`),
+
+  // ── Watched Threads ────────────────────────────────────────
+  watchAdd: db.prepare(`
+    INSERT OR IGNORE INTO watched_threads (channel_id, thread_ts, context)
+    VALUES (?, ?, ?)
+  `),
+  watchGet: db.prepare(`
+    SELECT thread_ts, context FROM watched_threads
+    WHERE channel_id = ? AND created_at > datetime('now', '-24 hours')
+    ORDER BY created_at DESC
+  `),
+  watchClean: db.prepare(`
+    DELETE FROM watched_threads WHERE created_at < datetime('now', '-48 hours')
+  `),
+  watchCount: db.prepare(`
+    SELECT COUNT(*) as cnt FROM watched_threads WHERE channel_id = ?
+    AND created_at > datetime('now', '-24 hours')
+  `),
 };
 
 // ── Inbox Helpers ──────────────────────────────────────────────
@@ -238,6 +266,8 @@ export function inboxUnreadCount(channelId: string): number {
 
 // 오래된 데이터 정리 (7일 이상 read/processed)
 stmts.inboxPurgeOld.run();
+// 오래된 watched threads 정리 (48시간 이상)
+stmts.watchClean.run();
 
 // ── Channel Cursor Helpers ─────────────────────────────────────
 
@@ -248,6 +278,24 @@ export function getChannelCursor(ch: string): string | undefined {
 
 export function setChannelCursor(ch: string, ts: string): void {
   stmts.cursorSet.run(ch, ts);
+}
+
+// ── Watched Thread Helpers ─────────────────────────────────────
+
+/** 봇이 보낸 메시지를 감시 대상으로 등록 (스레드 답글 감지용) */
+export function addWatchedThread(channelId: string, threadTs: string, context?: string): void {
+  stmts.watchAdd.run(channelId, threadTs, context || null);
+}
+
+/** 채널에서 최근 24시간 내 감시 중인 스레드 목록 */
+export function getWatchedThreads(channelId: string): Array<{ thread_ts: string; context: string | null }> {
+  return stmts.watchGet.all(channelId) as Array<{ thread_ts: string; context: string | null }>;
+}
+
+/** 채널의 감시 스레드 수 */
+export function getWatchedThreadCount(channelId: string): number {
+  const row = stmts.watchCount.get(channelId) as { cnt: number };
+  return row.cnt;
 }
 
 // ── Cost Report Helpers ────────────────────────────────────────

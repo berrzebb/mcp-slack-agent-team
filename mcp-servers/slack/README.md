@@ -8,9 +8,11 @@ Slack을 통해 Claude Code 에이전트를 원격으로 제어하고, 멀티 �
 
 - **원격 제어**: Slack 채널에서 Claude Code에게 명령을 보내고, 결과를 스레드로 받기
 - **명령 루프**: `slack_command_loop`로 채팅 인터페이스를 완전히 대체
+- **백그라운드 폴러**: 10초 간격 자동 메시지 수집 — 도구 호출 없이도 메시지 유실 방지
 - **긴 메시지 자동 처리**: 3,900자 초과 시 자동 분할, 8,000자 초과 시 파일 업로드
-- **에이전트 팀 관리**: 전용 채널 생성, 역할별 이름/아이콘 표시, 브로드캐스트
+- **에이전트 팀 관리**: 전용 채널 생성, 역할별 이름/아이콘 표시, 브로드캠스트
 - **영구 컨텍스트 관리**: SQLite 기반 태스크/의사결정/에이전트 컨텍스트 저장 — 컨텍스트 압축 후 즉시 복구
+- **핫 리로드**: `slack_reload`로 TypeScript 빌드 + 서버 재시작 — wrapper.js로 Claude Code 연결 유지
 - **승인 훅**: 위험 명령(git push, rm 등) 실행 전 Slack에서 승인 요청
 - **파일 전송**: Slack 파일 다운로드/업로드 (이미지, 문서, 로그 등)
 - **세션 복구**: compact/재시작 후 상태를 자동 복원
@@ -20,6 +22,8 @@ Slack을 통해 Claude Code 에이전트를 원격으로 제어하고, 멀티 �
 ```
 src/
 ├── index.ts               # 엔트리포인트 (도구 등록 + 서버 시작)
+├── wrapper.ts             # 자동 재시작 래퍼 (exit 42 → 핫 리로드)
+├── background-poller.ts   # 백그라운드 메시지 수집기 (10초 간격)
 ├── types.ts               # 인터페이스, 상수, 타입 정의
 ├── db.ts                  # SQLite 초기화 + 데이터 접근 헬퍼
 ├── state.ts               # JSON 상태 관리 + 팀 레지스트리
@@ -27,11 +31,11 @@ src/
 ├── formatting.ts          # 메시지 포맷 + 리치 포맷팅 유틸리티
 ├── approval-hook.ts       # 위험 명령 Slack 승인 훅
 └── tools/
-    ├── basic.ts           # 기본 통신 (6개 도구)
+    ├── basic.ts           # 기본 통신 + 응답 + 진단 (10개 도구)
     ├── content.ts         # 코드/스니펫 업로드 (2개 도구)
     ├── loop.ts            # 명령 루프 + 인박스 (3개 도구)
     ├── team.ts            # 팀 관리 (10개 도구)
-    ├── context.ts         # 팀 컨텍스트 관리 (7개 도구) ← NEW
+    ├── context.ts         # 팀 컨텍스트 관리 (7개 도구)
     ├── approval.ts        # 승인 요청 (1개 도구)
     ├── file.ts            # 파일 다운로드/업로드 (2개 도구)
     └── state.ts           # 상태 저장/복원 + 비용 보고 (3개 도구)
@@ -108,7 +112,7 @@ npx tsx src/test.ts
   "mcpServers": {
     "slack": {
       "command": "node",
-      "args": ["path/to/slack-mcp-server/dist/index.js"],
+      "args": ["path/to/slack-mcp-server/dist/wrapper.js"],
       "env": {
         "SLACK_BOT_TOKEN": "xoxb-your-bot-token",
         "SLACK_DEFAULT_CHANNEL": "C채널ID"
@@ -125,6 +129,23 @@ npx tsx src/test.ts
 >     "slack": {
 >       "command": "npx",
 >       "args": ["tsx", "path/to/slack-mcp-server/src/index.ts"],
+>       "env": {
+>         "SLACK_BOT_TOKEN": "xoxb-your-bot-token",
+>         "SLACK_DEFAULT_CHANNEL": "C채널ID",
+>         "BG_POLL_INTERVAL": "10000"
+>       }
+>     }
+>   }
+> }
+> ```
+>
+> **wrapper.js 없이** 직접 실행 시 `slack_reload`은 사용할 수 없지만 다른 모든 기능은 동일하게 동작합니다:
+> ```json
+> {
+>   "mcpServers": {
+>     "slack": {
+>       "command": "node",
+>       "args": ["path/to/slack-mcp-server/dist/index.js"],
 >       "env": {
 >         "SLACK_BOT_TOKEN": "xoxb-your-bot-token",
 >         "SLACK_DEFAULT_CHANNEL": "C채널ID"
@@ -191,19 +212,22 @@ Slack App → OAuth & Permissions → Bot Token Scopes:
 >
 > **승인 훅 추가**: + `reactions:read`
 
-## 제공 도구 (34개)
+## 제공 도구 (38개)
 
-### 기본 커뮤니케이션 (6개)
+### 기본 커뮤니케이션 + 응답 (10개)
 
 | 도구 | 설명 |
 |------|------|
 | `slack_send_message` | 채널에 메시지 전송 (긴 메시지 자동 분할/파일 업로드) |
+| `slack_respond` | 자동 라우팅 응답 — thread_ts 유무로 스레드/채널 자동 관단 (reply_mode 지원) |
+| `slack_update_message` | 보낸 메시지 수정 (진행 상태 업데이트, 오타 수정) |
 | `slack_read_messages` | 채널의 최근 메시지 읽기 |
 | `slack_reply_thread` | 스레드에 답장 |
-| `slack_wait_for_reply` | 새 메시지/답장 대기 (polling) |
 | `slack_add_reaction` | 이모지 리액션 추가 |
 | `slack_list_channels` | 접근 가능한 채널 목록 조회 |
 | `slack_get_thread` | 스레드 전체 읽기 |
+| `slack_reload` | MCP 서버 핫 리로드 (TypeScript 빌드 + 재시작, wrapper.js 필요) |
+| `slack_inbox_status` | 인박스 진단 — 커서, 미읽 건수, 감시 스레드, 건강 상태 확인 |
 
 ### 컨텐츠 처리 (2개)
 
@@ -216,8 +240,8 @@ Slack App → OAuth & Permissions → Bot Token Scopes:
 
 | 도구 | 설명 |
 |------|------|
-| `slack_command_loop` | Slack에서 사용자 명령 대기 루프 (채팅 대체 핵심 도구) |
-| `slack_check_inbox` | 채널별 읽지 않은 메시지 확인 (SQLite 기반 영구 인박스) |
+| `slack_command_loop` | Slack에서 사용자 명령 대기 루프 (백그라운드 폴러 데이터 우선 사용, 스레드 감시 지원) |
+| `slack_check_inbox` | SQLite 인박스에서 미읽 메시지 확인 (fresh=true로 즉시 폴링 가능) |
 | `slack_wait_for_reply` | 스레드/채널에서 새 메시지 대기 |
 
 ### 에이전트 팀 관리 (10개)
@@ -235,7 +259,7 @@ Slack App → OAuth & Permissions → Bot Token Scopes:
 | `slack_team_report` | 팀원이 메인 채널 + 팀 채널에 작업 상황 보고 |
 | `slack_team_close` | 채널 아카이브 + 최종 요약 + 태스크 일괄 완료 |
 
-### 🆕 팀 컨텍스트 관리 (7개)
+### 팀 컨텍스트 관리 (7개)
 
 > SQLite 기반 영구 저장소. 컨텍스트 압축(compaction) 후에도 유지되어 **~92% 토큰 절감**.
 
@@ -427,6 +451,7 @@ MCP 서버는 메시지 길이에 따라 최적의 전송 방식을 자동 선�
 | `SLACK_DEFAULT_CHANNEL` | 권장 | 기본 채널 ID (`C0123456789`) |
 | `SLACK_BOT_USER_ID` | - | 봇 User ID (미설정 시 자동 감지) |
 | `SLACK_APPROVAL_TIMEOUT` | - | 승인 훅 타임아웃 초 (기본: 120) |
+| `BG_POLL_INTERVAL` | - | 백그라운드 폴러 간격 ms (기본: 10000 = 10초) |
 
 ## 상태 관리 + 영구 컨텍스트
 
@@ -440,6 +465,7 @@ MCP 서버는 메시지 길이에 따라 최적의 전송 방식을 자동 선�
 |--------|------|----------|
 | `inbox` | 채널별 메시지 인박스 + 읽음 상태 | 7일 (자동 정리) |
 | `channel_cursors` | 채널별 마지막 읽은 위치 | 영구 |
+| `watched_threads` | 봇 메시지 스레드 감시 (답글 감지용) | 48시간 (자동 정리) |
 | `team_tasks` | 구조화된 태스크 (상태, 의존성, 결과 요약) | 영구 |
 | `agent_context` | 에이전트별 컨텍스트 스냅샷 | 영구 |
 | `team_decisions` | 의사결정 이력 (승인, 설계, 우선순위) | 영구 |
