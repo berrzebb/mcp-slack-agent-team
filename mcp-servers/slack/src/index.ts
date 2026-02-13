@@ -11,8 +11,10 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
 import { resolveBotUserId, getBotUserId } from "./slack-client.js";
-import { restoreTeamsFromState, saveTeamsToState, saveState } from "./state.js";
+import { restoreTeamsFromState, saveTeamsToState, migrateStateJsonToSqlite } from "./state.js";
 import { startBackgroundPoller, stopBackgroundPoller } from "./background-poller.js";
+import { SLACK_DEFAULT_CHANNEL } from "./types.js";
+import { slack } from "./slack-client.js";
 
 // Tool registrations
 import { registerBasicTools } from "./tools/basic.js";
@@ -55,6 +57,9 @@ async function main() {
     console.error(`🤖 Slack Bot connected (user: ${botId})`);
   }
 
+  // Migrate legacy state.json → SQLite (one-time, idempotent)
+  migrateStateJsonToSqlite();
+
   restoreTeamsFromState();
 
   const transport = new StdioServerTransport();
@@ -71,20 +76,17 @@ async function main() {
     // Stop background poller
     stopBackgroundPoller();
 
-    // Save team state
+    // Save team state to SQLite
     try {
       saveTeamsToState();
-      saveState({ updated_at: new Date().toISOString() } as any);
-      console.error("💾 State saved successfully");
+      console.error("💾 State saved to SQLite");
     } catch (err) {
       console.error("⚠️ State save failed:", err);
     }
 
     // Send shutdown notification to Slack (best effort)
     try {
-      const { SLACK_DEFAULT_CHANNEL } = await import("./types.js");
       if (SLACK_DEFAULT_CHANNEL) {
-        const { slack } = await import("./slack-client.js");
         await slack.chat.postMessage({
           channel: SLACK_DEFAULT_CHANNEL,
           text: `🔄 *MCP 서버 재시작 중* (${signal})... 잠시 후 복귀합니다.`,

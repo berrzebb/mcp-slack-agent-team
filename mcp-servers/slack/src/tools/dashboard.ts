@@ -12,15 +12,14 @@ import { AGENT_PERSONAS, SLACK_DEFAULT_CHANNEL } from "../types.js";
 import {
   getTeamTasks, getTeamContexts, getHeartbeats, getStaleAgents,
   updateHeartbeat, markAgentStale,
-  searchInbox, addScheduledMessage, getScheduledMessages, getPendingScheduledMessages, markScheduledSent,
+  searchInbox, addScheduledMessage,
   createPermissionRequest, resolvePermissionRequest, getPendingPermissions,
-  db,
+  pushMentionQueue, getPermissionStatus, getPermissionById,
 } from "../db.js";
 import {
   teams, getTeam, getRoleIcon, resolveChannel,
 } from "../state.js";
 import { slack, resolveBotUserId, sendSmart, sleep } from "../slack-client.js";
-import { formatMessages } from "../formatting.js";
 import { getRateLimiterMetrics } from "../rate-limiter.js";
 import type { SlackMessage } from "../types.js";
 
@@ -456,16 +455,43 @@ export function registerDashboardTools(server: McpServer): void {
 
   server.tool(
     "slack_team_request_permission",
-    "팀원이 리더에게 권한/승인을 요청합니다. 리더가 ✅(승인) 또는 ❌(거부) 리액션으로 응답할 때까지 대기합니다. 위험한 작업, 중요 변경사항, 외부 API 호출 등에 사용.",
+    "팀원이 리더에게 위험한 작업의 승인을 요청합니다. ⚠️ 메시지 보내기/읽기/보고 등 일반 Slack 작업에는 사용하지 마세요 — 그런 작업은 slack_team_send, slack_team_read, slack_team_report를 직접 호출하세요. DB 마이그레이션, 프로덕션 배포, 파일 삭제 등 파괴적/비가역적 작업에만 사용.",
     {
       team_id: z.string().describe("팀 식별자"),
       requester: z.string().describe("요청하는 팀원 멤버 ID"),
-      action: z.string().describe("수행하려는 작업 (예: 'DB 마이그레이션', '프로덕션 배포', 'API 키 생성')"),
+      action: z.string().describe("수행하려는 위험한 작업 (예: 'DB 마이그레이션', '프로덕션 배포', 'API 키 생성'). 일반 메시지/읽기/보고는 권한이 불필요."),
       reason: z.string().describe("권한이 필요한 이유"),
       timeout_seconds: z.number().min(30).max(600).default(180).describe("리더 응답 대기 시간 (초). 기본 180초(3분)."),
       poll_interval_seconds: z.number().min(2).max(30).default(5).describe("폴링 간격 (초)."),
     },
     async ({ team_id, requester, action, reason, timeout_seconds, poll_interval_seconds }) => {
+      // Auto-approve basic Slack operations that never need permission
+      const actionLower = action.toLowerCase();
+      const BASIC_OPS_PATTERNS = [
+        /\b(send|보내|전송|메시지|message|msg|chat)\b/i,
+        /\b(read|읽|조회|check|확인|fetch)\b/i,
+        /\b(report|보고|알림|notify|notification)\b/i,
+        /\b(mention|멘션|mention_check)\b/i,
+        /\b(heartbeat|status|상태)\b/i,
+        /\bslack_team_(send|read|report|broadcast|thread|wait|register)\b/i,
+        /\bslack_(mention_check|check_all_notifications|heartbeat)\b/i,
+      ];
+      const isBasicOp = BASIC_OPS_PATTERNS.some(p => p.test(action));
+      if (isBasicOp) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              ok: true,
+              approved: true,
+              method: "auto_approved",
+              action,
+              message: `✅ 자동 승인 — '${action}'은(는) 기본 작업이므로 권한 요청이 불필요합니다. 해당 도구를 직접 호출하세요. (slack_team_send, slack_team_read, slack_team_report 등)`,
+            }, null, 2),
+          }],
+        };
+      }
+
       const team = getTeam(team_id);
       const member = team.members.get(requester);
       const myUserId = await resolveBotUserId();
@@ -524,23 +550,44 @@ export function registerDashboardTools(server: McpServer): void {
         perm_id: permId,
       });
 
-      db.prepare(
-        `INSERT INTO kv_store (key, value) VALUES (?, ?)
-         ON CONFLICT(key) DO UPDATE SET value = json_insert(value, '$[#]', json(?)), updated_at = datetime('now')`
-      ).run(
-        `mention_queue:${leadId}`,
-        JSON.stringify([JSON.parse(mentionNotice)]),
-        mentionNotice,
-      );
+      pushMentionQueue(leadId, mentionNotice);
 
-      // Poll for reaction from any non-bot user (leader)
+      // Poll for reaction from any non-bot user (leader) — staggered (1 API call/cycle)
       const deadline = Date.now() + timeout_seconds * 1000;
       const interval = poll_interval_seconds * 1000;
+      let permCycle = 0;
 
       while (Date.now() < deadline) {
+        permCycle++;
         await sleep(interval);
 
+        // DB resolution check (every cycle, 0 API cost) — picks up slack_resolve_permission
         try {
+          const dbPerm = getPermissionStatus(permId);
+          if (dbPerm && dbPerm.status !== "pending") {
+            const isApproved = dbPerm.status === "approved";
+            const emoji = isApproved ? "white_check_mark" : "x";
+            await slack.reactions.add({ channel: team.channelId, name: emoji, timestamp: reqTs }).catch(() => {});
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  ok: true,
+                  approved: isApproved,
+                  method: "db_resolution",
+                  decided_by: dbPerm.decided_by,
+                  action,
+                  message: isApproved
+                    ? `✅ 권한 승인됨 — ${action}. 작업을 진행하세요.`
+                    : `❌ 권한 거부됨 — ${action}. 작업을 중단하세요.`,
+                }, null, 2),
+              }],
+            };
+          }
+        } catch { /* DB read failed, continue to API checks */ }
+
+        // Reactions check (odd cycles)
+        if (permCycle % 2 === 1) try {
           const reactResult = await slack.reactions.get({
             channel: team.channelId,
             timestamp: reqTs,
@@ -601,8 +648,8 @@ export function registerDashboardTools(server: McpServer): void {
           // reactions.get failed, continue polling
         }
 
-        // Also check thread replies
-        try {
+        // Also check thread replies (even cycles)
+        if (permCycle % 2 === 0) try {
           const threadResult = await slack.conversations.replies({
             channel: team.channelId,
             ts: reqTs,
@@ -676,7 +723,7 @@ export function registerDashboardTools(server: McpServer): void {
 
   server.tool(
     "slack_list_permissions",
-    "팀의 대기 중인 권한 요청 목록을 조회합니다. 리더가 미처리 요청을 확인할 때 사용.",
+    "팀의 대기 중인 권한 요청 목록을 조회합니다. 리더가 미처리 요청을 확인할 때 사용. slack_resolve_permission으로 승인/거부합니다.",
     {
       team_id: z.string().describe("팀 식별자"),
     },
@@ -698,11 +745,111 @@ export function registerDashboardTools(server: McpServer): void {
               message_ts: p.message_ts,
               channel: p.channel_id,
               created_at: p.created_at,
-              hint: `리액션으로 응답: ✅ ${p.message_ts}에 :white_check_mark: 또는 ❌ :x: 리액션`,
+              hint: `slack_resolve_permission(permission_id=${p.id}, decision="approved" 또는 "denied")로 처리`,
             })),
             message: pending.length > 0
-              ? `대기 중인 권한 요청 ${pending.length}건`
+              ? `대기 중인 권한 요청 ${pending.length}건. slack_resolve_permission으로 승인/거부하세요.`
               : "대기 중인 권한 요청 없음",
+          }, null, 2),
+        }],
+      };
+    }
+  );
+
+  // ── slack_resolve_permission ─────────────────────────────────
+
+  server.tool(
+    "slack_resolve_permission",
+    "리더/서브리더가 팀원의 권한 요청을 승인/거부합니다. slack_list_permissions 또는 slack_check_all_notifications로 대기 요청을 확인 후 호출. 요청자의 대기 폴링에 자동 감지됩니다.",
+    {
+      permission_id: z.number().describe("권한 요청 ID (slack_list_permissions에서 확인)"),
+      decision: z.enum(["approved", "denied"]).describe("승인(approved) 또는 거부(denied)"),
+      decided_by: z.string().describe("결정한 리더의 멤버 ID (예: Aria, Nova)"),
+      reason: z.string().optional().describe("결정 사유 (거부 시 권장)"),
+    },
+    async ({ permission_id, decision, decided_by, reason }) => {
+      // Look up the permission request
+      const perm = getPermissionById(permission_id);
+
+      if (!perm) {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({ ok: false, error: `권한 요청 #${permission_id}을 찾을 수 없습니다.` }, null, 2),
+          }],
+        };
+      }
+
+      if (perm.status !== "pending") {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              ok: false,
+              error: `이미 처리됨: ${perm.status}`,
+              permission_id,
+            }, null, 2),
+          }],
+        };
+      }
+
+      // Resolve in DB — this will be picked up by the requester's polling loop
+      resolvePermissionRequest(permission_id, decision, decided_by);
+
+      // Post response message in thread for visibility
+      const emoji = decision === "approved" ? "✅" : "❌";
+      const label = decision === "approved" ? "승인" : "거부";
+      const reasonText = reason ? `\n*사유:* ${reason}` : "";
+
+      try {
+        await slack.chat.postMessage({
+          channel: perm.channel_id,
+          thread_ts: perm.message_ts,
+          text: [
+            `${emoji} *권한 ${label}됨*`,
+            `*작업:* ${perm.action}`,
+            `*요청자:* ${perm.requester_id}`,
+            `*결정자:* ${decided_by}`,
+            reasonText,
+          ].filter(Boolean).join("\n"),
+          mrkdwn: true,
+        });
+
+        // Add visual reaction
+        const reactionName = decision === "approved" ? "white_check_mark" : "x";
+        await slack.reactions.add({ channel: perm.channel_id, name: reactionName, timestamp: perm.message_ts }).catch(() => {});
+      } catch (e) {
+        console.error(`[resolve_permission] Slack message failed:`, e);
+      }
+
+      // Notify requester via mention queue
+      const notice = JSON.stringify({
+        from: decided_by,
+        from_id: decided_by,
+        message: `[권한 ${label}] ${perm.action}${reason ? ` — ${reason}` : ""}`,
+        channel: perm.channel_id,
+        team_id: perm.team_id,
+        ts: new Date().toISOString(),
+        type: "permission_resolved",
+        perm_id: permission_id,
+        decision,
+      });
+
+      try {
+        pushMentionQueue(perm.requester_id, notice);
+      } catch { /* ignore */ }
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            ok: true,
+            permission_id,
+            decision,
+            action: perm.action,
+            requester: perm.requester_id,
+            decided_by,
+            message: `${emoji} 권한 요청 #${permission_id} ${label}됨 — ${perm.action}`,
           }, null, 2),
         }],
       };

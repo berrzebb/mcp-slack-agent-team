@@ -16,6 +16,7 @@ import {
 } from "../db.js";
 import { pollNow } from "../background-poller.js";
 
+
 // ── Reaction-as-Command ────────────────────────────────────────
 
 /** Reaction names that map to specific command intents */
@@ -128,6 +129,16 @@ function buildDigest(rows: InboxRow[], channel: string): {
 
   const groups = [...map.values()];
 
+  // Cap messages per group to prevent context overflow
+  const MAX_PER_GROUP = 5;
+  for (const g of groups) {
+    if (g.messages.length > MAX_PER_GROUP) {
+      const skippedCount = g.messages.length - MAX_PER_GROUP;
+      g.messages = g.messages.slice(-MAX_PER_GROUP);
+      g.messages.unshift(`(... ${skippedCount}건 이전 메시지 생략 ...)`);
+    }
+  }
+
   // Build a single combined text block for easy consumption
   const lines: string[] = [];
   for (const g of groups) {
@@ -174,8 +185,23 @@ export function registerLoopTools(server: McpServer): void {
         unread = unread.filter((r) => r.user_id !== myUserId);
       }
 
+      // Auto-fresh: inbox가 비어있으면 자동으로 pollNow 실행 (10초 폴링 지연 방지)
+      if (unread.length === 0 && !fresh) {
+        try { await pollNow(); } catch { /* best effort */ }
+        unread = inboxGetUnread(ch);
+        if (!include_bot) {
+          unread = unread.filter((r) => r.user_id !== myUserId);
+        }
+      }
+
       if (mark_as_read && unread.length > 0) {
         inboxMarkAllRead(ch, agent_id);
+      }
+
+      // Add 👀 reaction to latest user message to signal acknowledgment
+      if (unread.length > 0) {
+        const latest = unread[unread.length - 1];
+        try { await slack.reactions.add({ channel: ch, name: "eyes", timestamp: latest.message_ts }); } catch { /* already reacted */ }
       }
 
       const cursor = getChannelCursor(ch);
@@ -229,10 +255,10 @@ export function registerLoopTools(server: McpServer): void {
 
   server.tool(
     "slack_command_loop",
-    "Slack에서 사용자의 다음 명령을 대기합니다. Claude Code 채팅 인터페이스를 완전히 대체하는 핵심 도구입니다. 사용자가 명령을 입력할 때까지 polling하고, 명령을 수신하면 자동으로 👀 리액션 후 명령 내용을 반환합니다. 채널별 읽기 커서를 자동 추적하여 메시지 유실을 방지합니다.",
+    "Slack에서 사용자의 다음 명령을 대기합니다. timeout_seconds=0이면 인박스와 리액션을 1회 확인 후 즉시 반환합니다 (논블로킹 — 작업 중간에 주기적으로 호출하여 Slack 명령을 놓치지 않도록 사용). timeout_seconds>0이면 해당 시간만큼 polling합니다.",
     {
       channel: z.string().optional().describe("명령을 수신할 Slack 채널 ID"),
-      timeout_seconds: z.number().min(10).max(600).default(300).describe("대기 시간 (초). 기본 300초(5분). 타임아웃 시 재호출 필요."),
+      timeout_seconds: z.number().min(0).max(600).default(300).describe("대기 시간 (초). 0=논블로킹(1회 체크). 기본 300초(5분)."),
       poll_interval_seconds: z.number().min(2).max(30).default(3).describe("폴링 간격 (초). 기본 3초."),
       since_ts: z.string().optional().describe("이 타임스탬프 이후의 메시지만 감지. 미지정 시 채널 읽기 커서를 자동 사용 (권장)."),
       greeting: z.string().optional().describe("대기 시작 시 채널에 보낼 메시지 (예: '✅ 이전 작업 완료. 다음 명령을 기다립니다.')"),
@@ -278,8 +304,15 @@ export function registerLoopTools(server: McpServer): void {
         watchReactionTs = await findLastBotMessageTs(ch, myUserId);
       }
 
-      // 기존 unread 확인
-      const existingUnread = inboxGetUnread(ch);
+      // 기존 unread 확인 — 오래된 메시지 폭주 방지를 위해 최신 N건만 처리
+      let existingUnread = inboxGetUnread(ch);
+      // Filter out bot's own messages from backlog (prevent self-command loop)
+      existingUnread = existingUnread.filter((r) => r.user_id !== myUserId);
+      const totalBacklogCount = existingUnread.length;
+      const MAX_BACKLOG = 30;
+      if (existingUnread.length > MAX_BACKLOG) {
+        existingUnread = existingUnread.slice(-MAX_BACKLOG);
+      }
       if (existingUnread.length > 0) {
         const latest = existingUnread[existingUnread.length - 1];
         inboxMarkAllRead(ch, "command_loop");
@@ -315,21 +348,125 @@ export function registerLoopTools(server: McpServer): void {
                     )),
                   }
               ),
-              unread_count: existingUnread.length,
-              workflow: getWorkflowInstructions(existingUnread.length,
+              unread_count: totalBacklogCount,
+              skipped: totalBacklogCount > MAX_BACKLOG ? totalBacklogCount - MAX_BACKLOG : 0,
+              workflow: getWorkflowInstructions(totalBacklogCount,
                 existingUnread.some((r) => findTeamMentions(r.text).length > 0)),
             }, null, 2),
           }],
         };
       }
 
-      // Polling loop — SQLite-first: background poller가 10초마다 수집한 데이터를 읽음
-      while (Date.now() < deadline) {
-        // 백그라운드 폴러의 최신 데이터를 즉시 반영
-        await pollNow();
+      // ── Non-blocking mode (timeout_seconds === 0) ─────────────────
+      // Trigger a fresh poll so inbox is up-to-date, then check.
+      if (timeout_seconds === 0) {
+        try { await pollNow(); } catch { /* best effort */ }
 
-        // 1) 리액션 확인 (봇의 마지막 메시지에 대한 사용자 리액션)
+        // Re-check inbox after fresh poll
+        let freshUnread = inboxGetUnread(ch);
+        freshUnread = freshUnread.filter((r) => r.user_id !== myUserId);
+        if (freshUnread.length > 0) {
+          const latest = freshUnread[freshUnread.length - 1];
+          inboxMarkAllRead(ch, "command_loop");
+          setChannelCursor(ch, latest.message_ts);
+          try { await slack.reactions.add({ channel: ch, name: "eyes", timestamp: latest.message_ts }); } catch { /* already reacted */ }
+          saveState({ loop: { active: true, channel: ch, last_ts: latest.message_ts, started_at: new Date().toISOString() } });
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                command_received: true,
+                source: "inbox_fresh",
+                non_blocking: true,
+                ...enrichMessage(
+                  { text: latest.text, user: latest.user_id, ts: latest.message_ts, thread_ts: latest.thread_ts },
+                  ch,
+                ),
+                channel: ch,
+                all_messages: freshUnread.map((r) => enrichMessage(
+                  { text: r.text, user: r.user_id, ts: r.message_ts, thread_ts: r.thread_ts }, ch,
+                )),
+                unread_count: freshUnread.length,
+                workflow: getWorkflowInstructions(freshUnread.length,
+                  freshUnread.some((r) => findTeamMentions(r.text).length > 0)),
+              }, null, 2),
+            }],
+          };
+        }
+
         if (watchReactionTs) {
+          const reaction = await checkReactionCommand(ch, watchReactionTs, myUserId);
+          if (reaction) {
+            saveState({ loop: { active: true, channel: ch, last_ts: watchReactionTs, started_at: new Date().toISOString() } });
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  command_received: true,
+                  source: "reaction",
+                  non_blocking: true,
+                  text: reaction.command,
+                  reaction: reaction.reaction,
+                  user: reaction.user,
+                  reacted_message_ts: watchReactionTs,
+                  channel: ch,
+                  reply_to: { method: "slack_respond", channel: ch },
+                  workflow: [`사용자가 :${reaction.reaction}: 리액션으로 "${reaction.command}" 명령을 보냈습니다.`],
+                }, null, 2),
+              }],
+            };
+          }
+        }
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              command_received: false,
+              non_blocking: true,
+              channel: ch,
+              hint: "논블로킹: 새 명령 없음. 현재 작업을 계속 진행하세요.",
+              IMPORTANT: "⚠️ 반드시 5~10개 도구 호출마다 또는 30초마다 slack_command_loop(timeout_seconds=0) 또는 slack_check_inbox()를 재호출하세요. 주기적으로 체크하지 않으면 사용자 명령을 놓칩니다.",
+              next_check: "5~10 tool calls 또는 30초 후",
+            }, null, 2),
+          }],
+        };
+      }
+
+      // ── Blocking polling loop ─────────────────────────────────
+      // inbox-first: 대부분 cycle은 SQLite만 확인 (0 API calls)
+      // 매 4번째 cycle에만 Slack API로 fresh pull (1 API call)
+      // 매 3번째 cycle에만 reactions.get (1 API call)
+      let cycleCount = 0;
+      const FRESH_PULL_EVERY = 4;
+      const REACTION_CHECK_EVERY = 3;
+
+      while (Date.now() < deadline) {
+        cycleCount++;
+
+        // Fresh pull from Slack API (every 4th cycle only)
+        if (cycleCount % FRESH_PULL_EVERY === 0) {
+          try {
+            const pollCursor = getChannelCursor(ch);
+            const histResult = await slack.conversations.history({
+              channel: ch, limit: 10,
+              ...(pollCursor ? { oldest: pollCursor } : {}),
+            });
+            const freshMsgs = (histResult.messages || []) as SlackMessage[];
+            const newMsgs = freshMsgs.filter(
+              m => !pollCursor || m.ts !== pollCursor
+            );
+            if (newMsgs.length > 0) {
+              inboxIngest(ch, newMsgs);
+              const latestNewTs = newMsgs.reduce((max, m) => m.ts > max ? m.ts : max, newMsgs[0].ts);
+              setChannelCursor(ch, latestNewTs);
+            }
+          } catch {
+            // Rate limited or Slack API error — fall through to inbox check
+          }
+        }
+
+        // 1) 리액션 확인 (매 3rd cycle — 봇의 마지막 메시지에 대한 사용자 리액션)
+        if (watchReactionTs && cycleCount % REACTION_CHECK_EVERY === 0) {
           const reaction = await checkReactionCommand(ch, watchReactionTs, myUserId);
           if (reaction) {
             saveState({
@@ -356,13 +493,15 @@ export function registerLoopTools(server: McpServer): void {
         }
 
         // 2) SQLite inbox에서 미읽 메시지 확인
-        let unread = inboxGetUnread(ch);
-        unread = unread.filter((r) => r.user_id !== myUserId);
+        const allUnread = inboxGetUnread(ch);
+        const userUnread = allUnread.filter((r) => r.user_id !== myUserId);
+        // Bot messages (team reports sent via bot identity) — track as background activity
+        const botActivity = allUnread.filter((r) => r.user_id === myUserId);
 
-        if (unread.length > 0) {
+        if (userUnread.length > 0) {
           inboxMarkAllRead(ch, "command_loop");
 
-          const latest = unread[unread.length - 1];
+          const latest = userUnread[userUnread.length - 1];
           setChannelCursor(ch, latest.message_ts);
 
           try {
@@ -378,12 +517,28 @@ export function registerLoopTools(server: McpServer): void {
             },
           });
 
-          const sorted = unread.map((r) => ({
+          const sorted = userUnread.map((r) => ({
             text: r.text,
             user: r.user_id,
             ts: r.message_ts,
             thread_ts: r.thread_ts,
           } as SlackMessage));
+
+          // Include team activity summary if any bot messages accumulated
+          const teamActivitySummary = botActivity.length > 0
+            ? {
+                team_activity: {
+                  count: botActivity.length,
+                  recent: botActivity.slice(-5).map((r) => ({
+                    text: (r.text || "").substring(0, 200),
+                    ts: r.message_ts,
+                  })),
+                  hint: botActivity.length > 5
+                    ? `+${botActivity.length - 5}건 추가 팀 활동. slack_check_inbox(include_bot=true)로 전체 확인.`
+                    : undefined,
+                },
+              }
+            : {};
 
           return {
             content: [{
@@ -394,6 +549,7 @@ export function registerLoopTools(server: McpServer): void {
                 channel: ch,
                 all_messages: sorted.map((m) => enrichMessage(m, ch)),
                 unread_count: sorted.length,
+                ...teamActivitySummary,
                 workflow: getWorkflowInstructions(sorted.length,
                   sorted.some((m) => findTeamMentions(m.text).length > 0)),
               }, null, 2),
@@ -423,13 +579,13 @@ export function registerLoopTools(server: McpServer): void {
 
   server.tool(
     "slack_wait_for_reply",
-    "사용자의 새 메시지, 스레드 답장, 또는 리액션을 대기합니다. 사용자가 봇 메시지에 ✅/❌ 등 리액션을 추가하면 해당 명령으로 인식합니다.",
+    "사용자의 새 메시지, 스레드 답장, 또는 리액션을 대기합니다. timeout_seconds=0이면 1회 확인 후 즉시 반환 (논블로킹). 사용자가 봇 메시지에 ✅/❌ 등 리액션을 추가하면 해당 명령으로 인식합니다.",
     {
       channel: z.string().optional().describe("Slack 채널 ID (미지정 시 기본 채널 사용)"),
       thread_ts: z.string().optional().describe("특정 스레드의 답장만 대기할 경우 해당 스레드의 ts. 미지정 시 채널 전체 메시지 대기."),
       since_ts: z.string().optional().describe("이 타임스탬프 이후의 메시지만 감지. 미지정 시 현재 시점 이후."),
       watch_message_ts: z.string().optional().describe("이 메시지에 대한 리액션을 감시. 미지정 시 봇의 최근 메시지 자동 감시."),
-      timeout_seconds: z.number().min(5).max(300).default(60).describe("대기 시간 (초). 기본 60초, 최대 300초."),
+      timeout_seconds: z.number().min(0).max(300).default(60).describe("대기 시간 (초). 0=논블로킹. 기본 60초, 최대 300초."),
       poll_interval_seconds: z.number().min(2).max(30).default(5).describe("폴링 간격 (초). 기본 5초."),
     },
     async ({ channel, thread_ts, since_ts, watch_message_ts, timeout_seconds, poll_interval_seconds }) => {
@@ -443,10 +599,74 @@ export function registerLoopTools(server: McpServer): void {
       const deadline = Date.now() + timeout_seconds * 1000;
       const interval = poll_interval_seconds * 1000;
 
+      // ── Non-blocking mode (timeout_seconds === 0) ─────────────
+      if (timeout_seconds === 0) {
+        // Trigger a fresh poll so inbox is up-to-date
+        try { await pollNow(); } catch { /* best effort */ }
+
+        // Reaction
+        if (reactionTargetTs) {
+          const reaction = await checkReactionCommand(ch, reactionTargetTs, myUserId);
+          if (reaction) {
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  received: true, non_blocking: true, source: "reaction", count: 1,
+                  messages: [{ text: reaction.command, user: reaction.user, ts: reactionTargetTs, reaction: reaction.reaction }],
+                  channel: ch,
+                }, null, 2),
+              }],
+            };
+          }
+        }
+        // Inbox
+        let unread = inboxGetUnread(ch)
+          .filter((r) => r.user_id !== myUserId)
+          .filter((r) => r.message_ts > baseTs);
+        if (thread_ts) unread = unread.filter((r) => r.thread_ts === thread_ts);
+        if (unread.length > 0) {
+          inboxMarkAllRead(ch, "wait_for_reply");
+          const latestTs = unread[unread.length - 1].message_ts;
+          setChannelCursor(ch, latestTs);
+          try { await slack.reactions.add({ channel: ch, name: "eyes", timestamp: latestTs }); } catch { /* already reacted */ }
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                received: true, non_blocking: true, source: "inbox", count: unread.length,
+                messages: unread.map((r) => enrichMessage(
+                  { text: r.text, user: r.user_id, ts: r.message_ts, thread_ts: r.thread_ts }, ch,
+                )),
+                channel: ch,
+              }, null, 2),
+            }],
+          };
+        }
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              received: false, non_blocking: true, channel: ch,
+              hint: "논블로킹: 새 메시지 없음. 현재 작업을 계속하세요.",
+              IMPORTANT: "⚠️ 반드시 5~10개 도구 호출마다 또는 30초마다 slack_wait_for_reply(timeout_seconds=0) 또는 slack_check_inbox()를 재호출하세요. 주기적으로 체크하지 않으면 사용자 응답을 놓칩니다.",
+              next_check: "5~10 tool calls 또는 30초 후",
+            }, null, 2),
+          }],
+        };
+      }
+
+      // ── Blocking polling loop ─────────────────────────────────
+      let cycleCount = 0;
+      const API_EVERY = 3; // Only call Slack API every 3rd cycle
+
       while (Date.now() < deadline) {
+        cycleCount++;
+        const doApiFetch = cycleCount % API_EVERY === 0;
+
         try {
-          // 1) 리액션 확인
-          if (reactionTargetTs) {
+          // 1) 리액션 확인 (every 3rd cycle)
+          if (reactionTargetTs && doApiFetch) {
             const reaction = await checkReactionCommand(ch, reactionTargetTs, myUserId);
             if (reaction) {
               return {
@@ -470,49 +690,78 @@ export function registerLoopTools(server: McpServer): void {
             }
           }
 
-          // 2) 텍스트 메시지 확인
-          let messages: SlackMessage[] = [];
+          // 2) Inbox-first: check SQLite for messages already ingested by poller
+          let unread = inboxGetUnread(ch)
+            .filter((r) => r.user_id !== myUserId)
+            .filter((r) => r.message_ts > baseTs);
 
+          // Thread filter: if waiting for a specific thread, only show those
           if (thread_ts) {
-            const result = await slack.conversations.replies({
-              channel: ch,
-              ts: thread_ts,
-              oldest: baseTs,
-              limit: 20,
-            });
-            messages = ((result.messages || []) as SlackMessage[]).filter(
-              (m) => m.ts !== thread_ts
-            );
-          } else {
-            const result = await slack.conversations.history({
-              channel: ch,
-              oldest: baseTs,
-              limit: 20,
-            });
-            messages = (result.messages || []) as SlackMessage[];
+            unread = unread.filter((r) => r.thread_ts === thread_ts);
           }
 
-          const userMessages = messages.filter((m) => m.user !== myUserId);
-
-          if (userMessages.length > 0) {
-            const sorted = [...userMessages].reverse();
-            // Ingest into inbox for reliable tracking
-            inboxIngest(ch, sorted);
+          if (unread.length > 0) {
             inboxMarkAllRead(ch, "wait_for_reply");
-            const latestTs = sorted[sorted.length - 1].ts;
+            const latestTs = unread[unread.length - 1].message_ts;
             setChannelCursor(ch, latestTs);
+            try { await slack.reactions.add({ channel: ch, name: "eyes", timestamp: latestTs }); } catch { /* already reacted */ }
 
             return {
               content: [{
                 type: "text",
                 text: JSON.stringify({
                   received: true,
-                  count: sorted.length,
-                  messages: sorted.map((m) => enrichMessage(m, ch)),
+                  source: "inbox",
+                  count: unread.length,
+                  messages: unread.map((r) => enrichMessage(
+                    { text: r.text, user: r.user_id, ts: r.message_ts, thread_ts: r.thread_ts },
+                    ch,
+                  )),
                   channel: ch,
                 }, null, 2),
               }],
             };
+          }
+
+          // 3) Fresh API pull (every 3rd cycle as fallback)
+          if (doApiFetch) {
+            let messages: SlackMessage[] = [];
+            if (thread_ts) {
+              const result = await slack.conversations.replies({
+                channel: ch, ts: thread_ts, oldest: baseTs, limit: 20,
+              });
+              messages = ((result.messages || []) as SlackMessage[]).filter(
+                (m) => m.ts !== thread_ts
+              );
+            } else {
+              const result = await slack.conversations.history({
+                channel: ch, oldest: baseTs, limit: 20,
+              });
+              messages = (result.messages || []) as SlackMessage[];
+            }
+
+            const userMessages = messages.filter((m) => m.user !== myUserId);
+            if (userMessages.length > 0) {
+              const sorted = [...userMessages].reverse();
+              inboxIngest(ch, sorted);
+              inboxMarkAllRead(ch, "wait_for_reply");
+              const latestTs = sorted[sorted.length - 1].ts;
+              setChannelCursor(ch, latestTs);
+              try { await slack.reactions.add({ channel: ch, name: "eyes", timestamp: latestTs }); } catch { /* already reacted */ }
+
+              return {
+                content: [{
+                  type: "text",
+                  text: JSON.stringify({
+                    received: true,
+                    source: "api",
+                    count: sorted.length,
+                    messages: sorted.map((m) => enrichMessage(m, ch)),
+                    channel: ch,
+                  }, null, 2),
+                }],
+              };
+            }
           }
         } catch (err) {
           const errMsg = err instanceof Error ? err.message : String(err);

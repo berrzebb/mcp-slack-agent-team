@@ -6,7 +6,7 @@
 import Database, { type Database as DatabaseType, type Statement } from "better-sqlite3";
 import { existsSync, mkdirSync } from "fs";
 import { DB_FILE, STATE_DIR } from "./types.js";
-import type { InboxRow, SlackMessage, TeamTask, AgentContext, TeamDecision, TaskStatus } from "./types.js";
+import type { InboxRow, SlackMessage, TeamTask, AgentContext, TeamDecision, TaskStatus, LoopState, TeamMember } from "./types.js";
 
 // ── Database Initialization ────────────────────────────────────
 
@@ -14,144 +14,177 @@ if (!existsSync(STATE_DIR)) mkdirSync(STATE_DIR, { recursive: true });
 
 export const db: DatabaseType = new Database(DB_FILE);
 db.pragma("journal_mode = WAL");
+db.pragma("busy_timeout = 5000");
 db.pragma("foreign_keys = ON");
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS inbox (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    channel_id    TEXT    NOT NULL,
-    message_ts    TEXT    NOT NULL,
-    thread_ts     TEXT,
-    user_id       TEXT,
-    text          TEXT,
-    raw_json      TEXT,
-    status        TEXT    NOT NULL DEFAULT 'unread',
-    fetched_at    TEXT    NOT NULL DEFAULT (datetime('now')),
-    read_at       TEXT,
-    read_by       TEXT,
-    UNIQUE(channel_id, message_ts)
-  );
-  CREATE INDEX IF NOT EXISTS idx_inbox_status ON inbox(channel_id, status);
-  CREATE INDEX IF NOT EXISTS idx_inbox_ts ON inbox(channel_id, message_ts);
+// DDL wrapped in try-catch: multiple agent processes may race to create tables.
+// busy_timeout handles most contention, but if DDL still fails (tables already exist
+// from another process), the process must NOT crash.
+try {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS inbox (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      channel_id    TEXT    NOT NULL,
+      message_ts    TEXT    NOT NULL,
+      thread_ts     TEXT,
+      user_id       TEXT,
+      text          TEXT,
+      raw_json      TEXT,
+      status        TEXT    NOT NULL DEFAULT 'unread',
+      fetched_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+      read_at       TEXT,
+      read_by       TEXT,
+      UNIQUE(channel_id, message_ts)
+    );
+    CREATE INDEX IF NOT EXISTS idx_inbox_status ON inbox(channel_id, status);
+    CREATE INDEX IF NOT EXISTS idx_inbox_ts ON inbox(channel_id, message_ts);
+    CREATE INDEX IF NOT EXISTS idx_inbox_purge ON inbox(status, fetched_at);
 
-  CREATE TABLE IF NOT EXISTS channel_cursors (
-    channel_id    TEXT PRIMARY KEY,
-    last_read_ts  TEXT NOT NULL,
-    updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
-  );
+    CREATE TABLE IF NOT EXISTS channel_cursors (
+      channel_id    TEXT PRIMARY KEY,
+      last_read_ts  TEXT NOT NULL,
+      updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+    );
 
-  CREATE TABLE IF NOT EXISTS cost_reports (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp       TEXT    NOT NULL DEFAULT (datetime('now')),
-    report_type     TEXT,
-    total_cost_usd  REAL,
-    total_tokens    INTEGER,
-    input_tokens    INTEGER,
-    output_tokens   INTEGER,
-    cache_read      INTEGER,
-    cache_write     INTEGER,
-    raw_json        TEXT
-  );
+    CREATE TABLE IF NOT EXISTS cost_reports (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      timestamp       TEXT    NOT NULL DEFAULT (datetime('now')),
+      report_type     TEXT,
+      total_cost_usd  REAL,
+      total_tokens    INTEGER,
+      input_tokens    INTEGER,
+      output_tokens   INTEGER,
+      cache_read      INTEGER,
+      cache_write     INTEGER,
+      raw_json        TEXT
+    );
 
-  CREATE TABLE IF NOT EXISTS kv_store (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL,
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-  );
+    CREATE TABLE IF NOT EXISTS kv_store (
+      key   TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
 
-  -- Team Context: structured task assignments
-  CREATE TABLE IF NOT EXISTS team_tasks (
-    id            TEXT    NOT NULL,
-    team_id       TEXT    NOT NULL,
-    title         TEXT    NOT NULL,
-    description   TEXT    NOT NULL DEFAULT '',
-    assigned_to   TEXT    NOT NULL,
-    assigned_by   TEXT    NOT NULL,
-    track         TEXT,
-    dependencies  TEXT    NOT NULL DEFAULT '[]',
-    status        TEXT    NOT NULL DEFAULT 'pending',
-    result_summary TEXT,
-    created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
-    updated_at    TEXT    NOT NULL DEFAULT (datetime('now')),
-    completed_at  TEXT,
-    PRIMARY KEY (team_id, id)
-  );
-  CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON team_tasks(team_id, assigned_to);
-  CREATE INDEX IF NOT EXISTS idx_tasks_status ON team_tasks(team_id, status);
+    -- Team Context: structured task assignments
+    CREATE TABLE IF NOT EXISTS team_tasks (
+      id            TEXT    NOT NULL,
+      team_id       TEXT    NOT NULL,
+      title         TEXT    NOT NULL,
+      description   TEXT    NOT NULL DEFAULT '',
+      assigned_to   TEXT    NOT NULL,
+      assigned_by   TEXT    NOT NULL,
+      track         TEXT,
+      dependencies  TEXT    NOT NULL DEFAULT '[]',
+      status        TEXT    NOT NULL DEFAULT 'pending',
+      result_summary TEXT,
+      created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+      updated_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+      completed_at  TEXT,
+      PRIMARY KEY (team_id, id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON team_tasks(team_id, assigned_to);
+    CREATE INDEX IF NOT EXISTS idx_tasks_status ON team_tasks(team_id, status);
 
-  -- Team Context: per-agent context snapshots
-  CREATE TABLE IF NOT EXISTS agent_context (
-    agent_id          TEXT NOT NULL,
-    team_id           TEXT NOT NULL,
-    role              TEXT NOT NULL,
-    track             TEXT,
-    current_task_id   TEXT,
-    context_snapshot  TEXT NOT NULL DEFAULT '{}',
-    last_updated      TEXT NOT NULL DEFAULT (datetime('now')),
-    PRIMARY KEY (team_id, agent_id)
-  );
+    -- Team Context: per-agent context snapshots
+    CREATE TABLE IF NOT EXISTS agent_context (
+      agent_id          TEXT NOT NULL,
+      team_id           TEXT NOT NULL,
+      role              TEXT NOT NULL,
+      track             TEXT,
+      current_task_id   TEXT,
+      context_snapshot  TEXT NOT NULL DEFAULT '{}',
+      last_updated      TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (team_id, agent_id)
+    );
 
-  -- Team Context: decision log
-  CREATE TABLE IF NOT EXISTS team_decisions (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    team_id         TEXT    NOT NULL,
-    decision_type   TEXT    NOT NULL,
-    question        TEXT    NOT NULL,
-    answer          TEXT    NOT NULL,
-    decided_by      TEXT    NOT NULL,
-    created_at      TEXT    NOT NULL DEFAULT (datetime('now'))
-  );
-  CREATE INDEX IF NOT EXISTS idx_decisions_team ON team_decisions(team_id);
+    -- Team Context: decision log
+    CREATE TABLE IF NOT EXISTS team_decisions (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      team_id         TEXT    NOT NULL,
+      decision_type   TEXT    NOT NULL,
+      question        TEXT    NOT NULL,
+      answer          TEXT    NOT NULL,
+      decided_by      TEXT    NOT NULL,
+      created_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_decisions_team ON team_decisions(team_id);
 
-  -- Watched threads: bot-sent messages to monitor for user replies
-  CREATE TABLE IF NOT EXISTS watched_threads (
-    channel_id  TEXT NOT NULL,
-    thread_ts   TEXT NOT NULL,
-    context     TEXT,
-    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-    PRIMARY KEY (channel_id, thread_ts)
-  );
-  CREATE INDEX IF NOT EXISTS idx_watched_created ON watched_threads(created_at);
+    -- Watched threads: bot-sent messages to monitor for user replies
+    CREATE TABLE IF NOT EXISTS watched_threads (
+      channel_id  TEXT NOT NULL,
+      thread_ts   TEXT NOT NULL,
+      context     TEXT,
+      created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (channel_id, thread_ts)
+    );
+    CREATE INDEX IF NOT EXISTS idx_watched_created ON watched_threads(created_at);
 
-  -- Agent heartbeat tracking
-  CREATE TABLE IF NOT EXISTS agent_heartbeats (
-    agent_id    TEXT PRIMARY KEY,
-    team_id     TEXT,
-    status      TEXT NOT NULL DEFAULT 'alive',
-    last_seen   TEXT NOT NULL DEFAULT (datetime('now')),
-    metadata    TEXT
-  );
+    -- Agent heartbeat tracking
+    CREATE TABLE IF NOT EXISTS agent_heartbeats (
+      agent_id    TEXT PRIMARY KEY,
+      team_id     TEXT,
+      status      TEXT NOT NULL DEFAULT 'alive',
+      last_seen   TEXT NOT NULL DEFAULT (datetime('now')),
+      metadata    TEXT
+    );
 
-  -- Scheduled messages
-  CREATE TABLE IF NOT EXISTS scheduled_messages (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    channel_id    TEXT    NOT NULL,
-    message       TEXT    NOT NULL,
-    scheduled_at  TEXT    NOT NULL,
-    thread_ts     TEXT,
-    status        TEXT    NOT NULL DEFAULT 'pending',
-    slack_scheduled_id TEXT,
-    created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
-    created_by    TEXT
-  );
-  CREATE INDEX IF NOT EXISTS idx_sched_status ON scheduled_messages(status, scheduled_at);
+    -- Scheduled messages
+    CREATE TABLE IF NOT EXISTS scheduled_messages (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      channel_id    TEXT    NOT NULL,
+      message       TEXT    NOT NULL,
+      scheduled_at  TEXT    NOT NULL,
+      thread_ts     TEXT,
+      status        TEXT    NOT NULL DEFAULT 'pending',
+      slack_scheduled_id TEXT,
+      created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+      created_by    TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_sched_status ON scheduled_messages(status, scheduled_at);
 
-  -- Permission requests (leader auto-approval)
-  CREATE TABLE IF NOT EXISTS permission_requests (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    team_id       TEXT    NOT NULL,
-    requester_id  TEXT    NOT NULL,
-    action        TEXT    NOT NULL,
-    reason        TEXT    NOT NULL DEFAULT '',
-    status        TEXT    NOT NULL DEFAULT 'pending',
-    decided_by    TEXT,
-    decision_ts   TEXT,
-    message_ts    TEXT,
-    channel_id    TEXT,
-    created_at    TEXT    NOT NULL DEFAULT (datetime('now'))
-  );
-  CREATE INDEX IF NOT EXISTS idx_perm_status ON permission_requests(team_id, status);
-`);
+    -- Permission requests (leader auto-approval)
+    CREATE TABLE IF NOT EXISTS permission_requests (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      team_id       TEXT    NOT NULL,
+      requester_id  TEXT    NOT NULL,
+      action        TEXT    NOT NULL,
+      reason        TEXT    NOT NULL DEFAULT '',
+      status        TEXT    NOT NULL DEFAULT 'pending',
+      decided_by    TEXT,
+      decision_ts   TEXT,
+      message_ts    TEXT,
+      channel_id    TEXT,
+      created_at    TEXT    NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_perm_status ON permission_requests(team_id, status);
+
+    -- Teams registry (replaces state.json)
+    CREATE TABLE IF NOT EXISTS teams (
+      id            TEXT    PRIMARY KEY,
+      name          TEXT    NOT NULL,
+      channel_id    TEXT    NOT NULL,
+      channel_name  TEXT    NOT NULL DEFAULT '',
+      status        TEXT    NOT NULL DEFAULT 'active',
+      created_at    TEXT    NOT NULL DEFAULT (datetime('now'))
+    );
+
+    -- Team members (replaces nested JSON in state.json)
+    CREATE TABLE IF NOT EXISTS team_members (
+      team_id       TEXT    NOT NULL,
+      member_id     TEXT    NOT NULL,
+      role          TEXT    NOT NULL,
+      agent_type    TEXT    NOT NULL,
+      track         TEXT,
+      status        TEXT    NOT NULL DEFAULT 'active',
+      joined_at     TEXT    NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (team_id, member_id),
+      FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE CASCADE
+    );
+  `);
+} catch (ddlErr) {
+  // Another process likely created the tables already — non-fatal
+  console.error("[db] DDL init warning (likely concurrent startup):", ddlErr);
+}
 
 // ── Prepared Statements ────────────────────────────────────────
 
@@ -197,6 +230,7 @@ export const stmts: Record<string, Statement> = {
     INSERT INTO kv_store (key, value, updated_at) VALUES (?, ?, datetime('now'))
     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')
   `),
+  kvDelete: db.prepare(`DELETE FROM kv_store WHERE key = ?`),
 
   // ── Team Tasks ─────────────────────────────────────────────
   taskUpsert: db.prepare(`
@@ -231,6 +265,7 @@ export const stmts: Record<string, Statement> = {
   `),
   ctxGet: db.prepare(`SELECT * FROM agent_context WHERE team_id = ? AND agent_id = ?`),
   ctxByTeam: db.prepare(`SELECT * FROM agent_context WHERE team_id = ? ORDER BY agent_id ASC`),
+  ctxChannelLookup: db.prepare(`SELECT context_snapshot FROM agent_context WHERE agent_id = ? AND team_id = ?`),
 
   // ── Team Decisions ─────────────────────────────────────────
   decisionInsert: db.prepare(`
@@ -332,9 +367,14 @@ try {
 }
 
 // 오래된 데이터 정리 (7일 이상 read/processed)
-stmts.inboxPurgeOld.run();
-// 오래된 watched threads 정리 (48시간 이상)
-stmts.watchClean.run();
+// Wrapped in try-catch: concurrent processes may contend for write lock
+try {
+  stmts.inboxPurgeOld.run();
+  // 오래된 watched threads 정리 (48시간 이상)
+  stmts.watchClean.run();
+} catch (purgeErr) {
+  console.error("[db] Startup purge warning (likely concurrent access):", purgeErr);
+}
 
 // ── Auto-Purge Interval (every 6 hours) ────────────────────────
 
@@ -486,6 +526,29 @@ export function getAgentContext(teamId: string, agentId: string): AgentContext |
   };
 }
 
+/** 에이전트의 저장된 channelId 조회 (팀이 메모리에 없을 때 fallback용) */
+export function getAgentStoredChannelId(agentId: string, teamId: string): string | undefined {
+  // Try exact agent match first
+  if (agentId && agentId !== "_any_") {
+    const row = stmts.ctxChannelLookup.get(agentId, teamId) as { context_snapshot: string } | undefined;
+    if (row) {
+      try { return JSON.parse(row.context_snapshot)?.channelId; } catch { /* ignore */ }
+    }
+  }
+  // Fallback: any agent in this team (for tools that don't know the agent_id)
+  const anyRow = db.prepare(
+    `SELECT context_snapshot FROM agent_context WHERE team_id = ? LIMIT 1`
+  ).get(teamId) as { context_snapshot: string } | undefined;
+  if (anyRow) {
+    try { return JSON.parse(anyRow.context_snapshot)?.channelId; } catch { /* ignore */ }
+  }
+  // Last resort: check teams table directly
+  const teamRow = db.prepare(
+    `SELECT channel_id FROM teams WHERE id = ? AND status != 'archived' LIMIT 1`
+  ).get(teamId) as { channel_id: string } | undefined;
+  return teamRow?.channel_id;
+}
+
 /** 팀의 전체 에이전트 컨텍스트 */
 export function getTeamContexts(teamId: string): AgentContext[] {
   return (stmts.ctxByTeam.all(teamId) as Record<string, unknown>[]).map((row) => ({
@@ -521,23 +584,32 @@ export function getRecentDecisions(teamId: string, limit: number = 10): TeamDeci
 
 // ── Heartbeat Helpers ──────────────────────────────────────────
 
+const stmtHeartbeatUpsert = db.prepare(`
+  INSERT INTO agent_heartbeats (agent_id, team_id, status, last_seen, metadata)
+  VALUES (?, ?, 'alive', datetime('now'), ?)
+  ON CONFLICT(agent_id) DO UPDATE SET
+    team_id = COALESCE(excluded.team_id, team_id),
+    status = 'alive',
+    last_seen = datetime('now'),
+    metadata = COALESCE(excluded.metadata, metadata)
+`);
+const stmtHeartbeatAll = db.prepare(`SELECT * FROM agent_heartbeats ORDER BY last_seen DESC`);
+const stmtHeartbeatStale = db.prepare(`
+  SELECT agent_id, team_id, last_seen FROM agent_heartbeats
+  WHERE last_seen < datetime('now', '-' || ? || ' minutes')
+  AND status = 'alive'
+`);
+const stmtHeartbeatMarkStale = db.prepare(`UPDATE agent_heartbeats SET status = 'stale' WHERE agent_id = ?`);
+
 export function updateHeartbeat(agentId: string, teamId?: string, metadata?: Record<string, unknown>): void {
-  db.prepare(`
-    INSERT INTO agent_heartbeats (agent_id, team_id, status, last_seen, metadata)
-    VALUES (?, ?, 'alive', datetime('now'), ?)
-    ON CONFLICT(agent_id) DO UPDATE SET
-      team_id = COALESCE(excluded.team_id, team_id),
-      status = 'alive',
-      last_seen = datetime('now'),
-      metadata = COALESCE(excluded.metadata, metadata)
-  `).run(agentId, teamId || null, metadata ? JSON.stringify(metadata) : null);
+  stmtHeartbeatUpsert.run(agentId, teamId || null, metadata ? JSON.stringify(metadata) : null);
 }
 
 export function getHeartbeats(): Array<{
   agent_id: string; team_id: string | null;
   status: string; last_seen: string; metadata: string | null;
 }> {
-  return db.prepare(`SELECT * FROM agent_heartbeats ORDER BY last_seen DESC`).all() as Array<{
+  return stmtHeartbeatAll.all() as Array<{
     agent_id: string; team_id: string | null;
     status: string; last_seen: string; metadata: string | null;
   }>;
@@ -547,51 +619,72 @@ export function getStaleAgents(thresholdMinutes: number = 5): Array<{
   agent_id: string; team_id: string | null;
   last_seen: string;
 }> {
-  return db.prepare(`
-    SELECT agent_id, team_id, last_seen FROM agent_heartbeats
-    WHERE last_seen < datetime('now', '-' || ? || ' minutes')
-    AND status = 'alive'
-  `).all(thresholdMinutes) as Array<{
+  return stmtHeartbeatStale.all(thresholdMinutes) as Array<{
     agent_id: string; team_id: string | null;
     last_seen: string;
   }>;
 }
 
 export function markAgentStale(agentId: string): void {
-  db.prepare(`UPDATE agent_heartbeats SET status = 'stale' WHERE agent_id = ?`).run(agentId);
+  stmtHeartbeatMarkStale.run(agentId);
 }
 
 // ── Inbox Search Helpers ───────────────────────────────────────
 
-export function searchInbox(query: string, limit: number = 20): InboxRow[] {
-  // Try FTS5 first, fallback to LIKE
-  try {
-    const rows = db.prepare(`
-      SELECT inbox.* FROM inbox_fts
-      JOIN inbox ON inbox.id = inbox_fts.rowid
-      WHERE inbox_fts MATCH ?
-      ORDER BY inbox.message_ts DESC
-      LIMIT ?
-    `).all(query, limit) as InboxRow[];
-    return rows;
-  } catch {
-    // FTS5 not available — LIKE fallback
-    return db.prepare(`
-      SELECT * FROM inbox
-      WHERE text LIKE ?
-      ORDER BY message_ts DESC
-      LIMIT ?
-    `).all(`%${query}%`, limit) as InboxRow[];
+let stmtSearchFts: Statement | null | undefined = null;
+const stmtSearchLike = db.prepare(`
+  SELECT * FROM inbox WHERE text LIKE ? ORDER BY message_ts DESC LIMIT ?
+`);
+
+// Lazily compile FTS5 query (table may not exist in all envs)
+function getSearchFts() {
+  if (stmtSearchFts === null) {
+    try {
+      stmtSearchFts = db.prepare(`
+        SELECT inbox.* FROM inbox_fts
+        JOIN inbox ON inbox.id = inbox_fts.rowid
+        WHERE inbox_fts MATCH ?
+        ORDER BY inbox.message_ts DESC LIMIT ?
+      `);
+    } catch {
+      stmtSearchFts = undefined;  // mark as unavailable
+    }
   }
+  return stmtSearchFts;
+}
+
+export function searchInbox(query: string, limit: number = 20): InboxRow[] {
+  const fts = getSearchFts();
+  if (fts) {
+    try {
+      return fts.all(query, limit) as InboxRow[];
+    } catch { /* FTS match syntax error — fall through */ }
+  }
+  return stmtSearchLike.all(`%${query}%`, limit) as InboxRow[];
 }
 
 // ── Scheduled Message Helpers ──────────────────────────────────
 
+const stmtSchedInsert = db.prepare(`
+  INSERT INTO scheduled_messages (channel_id, message, scheduled_at, thread_ts, created_by)
+  VALUES (?, ?, ?, ?, ?)
+`);
+const stmtSchedPending = db.prepare(`
+  SELECT * FROM scheduled_messages
+  WHERE status = 'pending' AND scheduled_at <= datetime('now')
+  ORDER BY scheduled_at ASC
+`);
+const stmtSchedMarkSent = db.prepare(`
+  UPDATE scheduled_messages SET status = 'sent', slack_scheduled_id = ?
+  WHERE id = ?
+`);
+const stmtSchedByChannel = db.prepare(`
+  SELECT * FROM scheduled_messages WHERE channel_id = ? ORDER BY scheduled_at ASC
+`);
+const stmtSchedAll = db.prepare(`SELECT * FROM scheduled_messages ORDER BY scheduled_at ASC`);
+
 export function addScheduledMessage(channelId: string, message: string, scheduledAt: string, threadTs?: string, createdBy?: string): number {
-  const result = db.prepare(`
-    INSERT INTO scheduled_messages (channel_id, message, scheduled_at, thread_ts, created_by)
-    VALUES (?, ?, ?, ?, ?)
-  `).run(channelId, message, scheduledAt, threadTs || null, createdBy || null);
+  const result = stmtSchedInsert.run(channelId, message, scheduledAt, threadTs || null, createdBy || null);
   return result.lastInsertRowid as number;
 }
 
@@ -599,21 +692,14 @@ export function getPendingScheduledMessages(): Array<{
   id: number; channel_id: string; message: string;
   scheduled_at: string; thread_ts: string | null; status: string;
 }> {
-  return db.prepare(`
-    SELECT * FROM scheduled_messages
-    WHERE status = 'pending' AND scheduled_at <= datetime('now')
-    ORDER BY scheduled_at ASC
-  `).all() as Array<{
+  return stmtSchedPending.all() as Array<{
     id: number; channel_id: string; message: string;
     scheduled_at: string; thread_ts: string | null; status: string;
   }>;
 }
 
 export function markScheduledSent(id: number, slackId?: string): void {
-  db.prepare(`
-    UPDATE scheduled_messages SET status = 'sent', slack_scheduled_id = ?
-    WHERE id = ?
-  `).run(slackId || null, id);
+  stmtSchedMarkSent.run(slackId || null, id);
 }
 
 export function getScheduledMessages(channelId?: string): Array<{
@@ -621,14 +707,12 @@ export function getScheduledMessages(channelId?: string): Array<{
   scheduled_at: string; status: string; created_by: string | null;
 }> {
   if (channelId) {
-    return db.prepare(`
-      SELECT * FROM scheduled_messages WHERE channel_id = ? ORDER BY scheduled_at ASC
-    `).all(channelId) as Array<{
+    return stmtSchedByChannel.all(channelId) as Array<{
       id: number; channel_id: string; message: string;
       scheduled_at: string; status: string; created_by: string | null;
     }>;
   }
-  return db.prepare(`SELECT * FROM scheduled_messages ORDER BY scheduled_at ASC`).all() as Array<{
+  return stmtSchedAll.all() as Array<{
     id: number; channel_id: string; message: string;
     scheduled_at: string; status: string; created_by: string | null;
   }>;
@@ -636,19 +720,27 @@ export function getScheduledMessages(channelId?: string): Array<{
 
 // ── Permission Request Helpers ─────────────────────────────────
 
+const stmtPermInsert = db.prepare(`
+  INSERT INTO permission_requests (team_id, requester_id, action, reason, message_ts, channel_id)
+  VALUES (?, ?, ?, ?, ?, ?)
+`);
+const stmtPermResolve = db.prepare(`
+  UPDATE permission_requests SET status = ?, decided_by = ?, decision_ts = datetime('now')
+  WHERE id = ?
+`);
+const stmtPermPending = db.prepare(`
+  SELECT * FROM permission_requests
+  WHERE team_id = ? AND status = 'pending'
+  ORDER BY created_at ASC
+`);
+
 export function createPermissionRequest(teamId: string, requesterId: string, action: string, reason: string, messageTs: string, channelId: string): number {
-  const result = db.prepare(`
-    INSERT INTO permission_requests (team_id, requester_id, action, reason, message_ts, channel_id)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).run(teamId, requesterId, action, reason, messageTs, channelId);
+  const result = stmtPermInsert.run(teamId, requesterId, action, reason, messageTs, channelId);
   return result.lastInsertRowid as number;
 }
 
 export function resolvePermissionRequest(id: number, status: "approved" | "denied", decidedBy: string): void {
-  db.prepare(`
-    UPDATE permission_requests SET status = ?, decided_by = ?, decision_ts = datetime('now')
-    WHERE id = ?
-  `).run(status, decidedBy, id);
+  stmtPermResolve.run(status, decidedBy, id);
 }
 
 export function getPendingPermissions(teamId: string): Array<{
@@ -656,15 +748,155 @@ export function getPendingPermissions(teamId: string): Array<{
   reason: string; message_ts: string; channel_id: string;
   created_at: string;
 }> {
-  return db.prepare(`
-    SELECT * FROM permission_requests
-    WHERE team_id = ? AND status = 'pending'
-    ORDER BY created_at ASC
-  `).all(teamId) as Array<{
+  return stmtPermPending.all(teamId) as Array<{
     id: number; requester_id: string; action: string;
     reason: string; message_ts: string; channel_id: string;
     created_at: string;
   }>;
+}
+
+// ── Mention Queue Helper ───────────────────────────────────────
+
+const stmtMentionQueueUpsert = db.prepare(
+  `INSERT INTO kv_store (key, value) VALUES (?, ?)
+   ON CONFLICT(key) DO UPDATE SET value = json_insert(value, '$[#]', json(?)), updated_at = datetime('now')`
+);
+
+/** Push a mention notice JSON string into the queue for the given key (memberId or role) */
+export function pushMentionQueue(queueKey: string, noticeJson: string): void {
+  stmtMentionQueueUpsert.run(
+    `mention_queue:${queueKey}`,
+    JSON.stringify([JSON.parse(noticeJson)]),
+    noticeJson,
+  );
+}
+
+// ── Permission Status Check (cached) ──────────────────────────
+
+const stmtPermStatusCheck = db.prepare(
+  `SELECT status, decided_by FROM permission_requests WHERE id = ?`
+);
+
+export function getPermissionStatus(id: number): { status: string; decided_by: string | null } | undefined {
+  return stmtPermStatusCheck.get(id) as { status: string; decided_by: string | null } | undefined;
+}
+
+const stmtPermById = db.prepare(`SELECT * FROM permission_requests WHERE id = ?`);
+
+export interface PermissionRequestRow {
+  id: number; team_id: string; requester_id: string; action: string;
+  reason: string; status: string; message_ts: string; channel_id: string;
+  decided_by: string | null; decision_ts: string | null; created_at: string;
+}
+
+export function getPermissionById(id: number): PermissionRequestRow | undefined {
+  return stmtPermById.get(id) as PermissionRequestRow | undefined;
+}
+
+// ── Teams DB Helpers (replaces state.json) ─────────────────────
+
+const stmtTeamUpsert = db.prepare(`
+  INSERT INTO teams (id, name, channel_id, channel_name, status, created_at)
+  VALUES (?, ?, ?, ?, ?, ?)
+  ON CONFLICT(id) DO UPDATE SET
+    name = excluded.name, channel_id = excluded.channel_id,
+    channel_name = excluded.channel_name, status = excluded.status
+`);
+const stmtTeamDelete = db.prepare(`DELETE FROM teams WHERE id = ?`);
+const stmtTeamGet = db.prepare(`SELECT * FROM teams WHERE id = ?`);
+const stmtTeamAll = db.prepare(`SELECT * FROM teams WHERE status != 'archived' ORDER BY created_at ASC`);
+const stmtTeamAllIds = db.prepare(`SELECT id FROM teams`);
+const stmtTeamArchive = db.prepare(`UPDATE teams SET status = 'archived' WHERE id = ?`);
+const stmtMemberUpsert = db.prepare(`
+  INSERT INTO team_members (team_id, member_id, role, agent_type, track, status, joined_at)
+  VALUES (?, ?, ?, ?, ?, ?, ?)
+  ON CONFLICT(team_id, member_id) DO UPDATE SET
+    role = excluded.role, agent_type = excluded.agent_type,
+    track = excluded.track, status = excluded.status
+`);
+const stmtMembersByTeam = db.prepare(`SELECT * FROM team_members WHERE team_id = ? ORDER BY member_id ASC`);
+const stmtMembersDeleteTeam = db.prepare(`DELETE FROM team_members WHERE team_id = ?`);
+
+export interface DbTeamRow {
+  id: string; name: string; channel_id: string; channel_name: string;
+  status: string; created_at: string;
+}
+export interface DbTeamMemberRow {
+  team_id: string; member_id: string; role: string; agent_type: string;
+  track: string | null; status: string; joined_at: string;
+}
+
+/** Save a single team + all its members (upsert) */
+export function dbSaveTeam(
+  team: { id: string; name: string; channelId: string; channelName: string; status: string; createdAt: string },
+  members: Array<{ id: string } & TeamMember>,
+): void {
+  const tx = db.transaction(() => {
+    stmtTeamUpsert.run(team.id, team.name, team.channelId, team.channelName, team.status, team.createdAt);
+    // Replace all members for this team
+    stmtMembersDeleteTeam.run(team.id);
+    for (const m of members) {
+      stmtMemberUpsert.run(team.id, m.id, m.role, m.agentType, m.track || null, m.status, m.joinedAt);
+    }
+  });
+  tx();
+}
+
+/** Load all active teams from DB */
+export function dbLoadAllTeams(): Array<{ team: DbTeamRow; members: DbTeamMemberRow[] }> {
+  const teamRows = stmtTeamAll.all() as DbTeamRow[];
+  return teamRows.map((t) => ({
+    team: t,
+    members: stmtMembersByTeam.all(t.id) as DbTeamMemberRow[],
+  }));
+}
+
+/** Load a single team by ID */
+export function dbLoadTeam(teamId: string): { team: DbTeamRow; members: DbTeamMemberRow[] } | null {
+  const t = stmtTeamGet.get(teamId) as DbTeamRow | undefined;
+  if (!t) return null;
+  return { team: t, members: stmtMembersByTeam.all(t.id) as DbTeamMemberRow[] };
+}
+
+/** Save all teams at once (bulk — for shutdown/periodic save).
+ *  NOTE: Does NOT archive orphaned teams. In multi-process environments,
+ *  each process only knows about teams it loaded or created.
+ *  Archiving unknown teams would destroy teams created by other processes.
+ *  Use slack_team_close for explicit archival. */
+export function dbSaveAllTeams(
+  teamList: Array<{
+    team: { id: string; name: string; channelId: string; channelName: string; status: string; createdAt: string };
+    members: Array<{ id: string } & TeamMember>;
+  }>,
+): void {
+  const tx = db.transaction((list: typeof teamList) => {
+    for (const { team, members } of list) {
+      stmtTeamUpsert.run(team.id, team.name, team.channelId, team.channelName, team.status, team.createdAt);
+      stmtMembersDeleteTeam.run(team.id);
+      for (const m of members) {
+        stmtMemberUpsert.run(team.id, m.id, m.role, m.agentType, m.track || null, m.status, m.joinedAt);
+      }
+    }
+  });
+  tx(teamList);
+}
+
+// ── Loop State (via kv_store) ──────────────────────────────────
+
+const LOOP_STATE_KEY = "loop_state";
+
+export function dbSaveLoopState(loop: LoopState): void {
+  stmts.kvSet.run(LOOP_STATE_KEY, JSON.stringify(loop));
+}
+
+export function dbLoadLoopState(): LoopState | null {
+  const row = stmts.kvGet.get(LOOP_STATE_KEY) as { value: string } | undefined;
+  if (!row) return null;
+  try {
+    return JSON.parse(row.value) as LoopState;
+  } catch {
+    return null;
+  }
 }
 
 console.error(`📦 SQLite DB initialized: ${DB_FILE}`);

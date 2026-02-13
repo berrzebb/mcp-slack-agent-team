@@ -16,13 +16,10 @@ Slack을 통해 Claude Code 에이전트를 원격으로 제어하고, 멀티 �
 - **핫 리로드**: `slack_reload`로 TypeScript 빌드 + 서버 재시작 — wrapper.js로 Claude Code 연결 유지
 - **승인 훅**: 위험 명령(git push, rm 등) + MCP 도구 + 권한 요청 모두 Slack 승인 지원, 안전 명령 자동 바이패스
 - **파일 전송**: Slack 파일 다운로드/업로드 (이미지, 문서, 로그 등)
-- **하트비트**: 에이전트 생존 감시 — 무응답 에이전트 자동 감지 + 리더 알림
-- **대시보드**: 팀 진행률·에이전트 상태·Rate Limiter 메트릭을 카드 형태 대시보드로 표시
-- **Rate Limiter**: Slack API 중앙집중 토큰 버킷 + 429 자동 백오프 + 메트릭 수집
-- **DM + 예약 메시지**: 개인 DM, 예약 전송, 메시지 고정
-- **인박스 검색**: FTS5 전문검색으로 맞춤형 메시지 검색
-- **팀 권한 요청**: 팀원→리더 권한 요청/승인 워크플로우 (Slack 리액션/텍스트 응답)
-- **그레이스풀 셧다운**: SIGINT/SIGTERM 시 상태 자동 저장 + Slack 재시작 알림
+- **논블로킹 모드**: `slack_command_loop(timeout=0)`, `slack_team_wait(timeout=0)`으로 작업 중에도 Slack 명령 놓침 방지
+- **멀티프로세스 안전**: SQLite WAL + busy_timeout + 폴러 DB 리스 + 팀별 개별 저장 — 여러 에이전트가 동시 접근해도 데이터 손실 없음
+- **state.json → SQLite 이관**: 모든 상태(teams, loop) SQLite 영구 저장, 자동 마이그레이션
+- **세션 복구**: compact/재시작 후 `slack_whoami`로 즉시 복구
 
 ## 프로젝트 구조
 
@@ -33,21 +30,21 @@ src/
 ├── background-poller.ts   # 백그라운드 메시지 수집기 (10초 간격)
 ├── types.ts               # 인터페이스, 상수, 타입 정의 + 에이전트 페르소나
 ├── db.ts                  # SQLite 초기화 + 데이터 접근 헬퍼
-├── state.ts               # JSON 상태 관리 + 팀 레지스트리
+├── state.ts               # SQLite 기반 상태 관리 + 팀 레지스트리
 ├── slack-client.ts        # WebClient + sendSmart + 메시지 분할
 ├── formatting.ts          # 메시지 포맷 + 리치 포맷팅 유틸리티
 ├── rate-limiter.ts        # 중앙집중 Rate Limiter (토큰 버킷 + 자동 백오프)
 ├── approval-hook.ts       # 범용 Slack 승인 훅 (Bash + 도구 + 권한)
 └── tools/
-    ├── basic.ts           # 기본 통신 + 응답 + 진단 (10개 도구)
+    ├── basic.ts           # 기본 통신 + 리액션 관리 + 진단 (11개 도구)
     ├── content.ts         # 코드/스니펫 업로드 (2개 도구)
     ├── loop.ts            # 명령 루프 + 인박스 + 리액션 커맨드 (3개 도구)
-    ├── team.ts            # 팀 관리 + 페르소나 멘션 (11개 도구)
-    ├── context.ts         # 팀 컨텍스트 관리 (7개 도구)
+    ├── team.ts            # 팀 관리 + 멘션 + 알림 통합 (14개 도구)
+    ├── context.ts         # 팀 컨텍스트 관리 + whoami (8개 도구)
     ├── approval.ts        # 승인 요청 (1개 도구)
     ├── file.ts            # 파일 다운로드/업로드 (2개 도구)
     ├── state.ts           # 상태 저장/복원 + 비용 보고 (3개 도구)
-    └── dashboard.ts       # 대시보드 + 하트비트 + DM + 예약/검색/권한 (10개 도구)
+    └── dashboard.ts       # 대시보드 + 하트비트 + DM + 예약/권한 (11개 도구)
 ```
 
 ## 워크플로우
@@ -242,9 +239,9 @@ Slack App → OAuth & Permissions → Bot Token Scopes:
 >
 > **대시보드/DM 추가**: + `pins:write`, `im:write`
 
-## 제공 도구 (49개)
+## 제공 도구 (55개)
 
-### 기본 커뮤니케이션 + 응답 (10개)
+### 기본 커뮤니케이션 + 리액션 (11개)
 
 | 도구 | 설명 |
 |------|------|
@@ -253,7 +250,8 @@ Slack App → OAuth & Permissions → Bot Token Scopes:
 | `slack_update_message` | 보낸 메시지 수정 (진행 상태 업데이트, 오타 수정) |
 | `slack_read_messages` | 채널의 최근 메시지 읽기 |
 | `slack_reply_thread` | 스레드에 답장 |
-| `slack_add_reaction` | 이모지 리액션 추가 |
+| `slack_add_reaction` | 이모지 리액션 추가 (👀 확인, ✅ 완료, 🚀 시작, 🔥 긴급, ⏳ 진행중, 🎉 축하, 📝 검토 등) |
+| `slack_remove_reaction` | 리액션 제거 (상태 변경 시 이전 리액션 정리: ⏳→✅) |
 | `slack_list_channels` | 접근 가능한 채널 목록 조회 |
 | `slack_get_thread` | 스레드 전체 읽기 |
 | `slack_reload` | MCP 서버 핫 리로드 (TypeScript 빌드 + 재시작, wrapper.js 필요) |
@@ -270,27 +268,30 @@ Slack App → OAuth & Permissions → Bot Token Scopes:
 
 | 도구 | 설명 |
 |------|------|
-| `slack_command_loop` | Slack에서 사용자 명령 대기 루프 (백그라운드 폴러 데이터 우선 사용, 스레드 감시 지원) |
+| `slack_command_loop` | Slack에서 사용자 명령 대기 (timeout=0: 논블로킹 1회 체크, timeout>0: 폴링) |
 | `slack_check_inbox` | SQLite 인박스에서 미읽 메시지 확인 (fresh=true로 즉시 폴링 가능) |
 | `slack_wait_for_reply` | 스레드/채널에서 새 메시지 대기 |
 
-### 에이전트 팀 관리 (11개)
+### 에이전트 팀 관리 + 알림 통합 (14개)
 
 | 도구 | 설명 |
 |------|------|
 | `slack_team_create` | 팀 전용 채널 생성 + 초기 멤버 등록 (이름 충돌 시 기존 채널 재사용) |
 | `slack_team_register` | 기존 팀에 새 멤버 추가 |
 | `slack_team_send` | 페르소나 이름/아이콘으로 메시지 전송 (@멘션 → 멘션 큐 저장) |
-| `slack_team_read` | 팀 채널 메시지 읽기 (sender 필터 가능) |
-| `slack_team_wait` | 팀 채널에서 새 메시지 대기 (sender/keyword 필터) |
+| `slack_team_read` | 팀 채널 메시지 읽기 (인박스 우선 0 API, fresh=true로 API fallback) |
+| `slack_team_wait` | 팀 채널 새 메시지 대기 (timeout=0: 논블로킹, 인박스+API staggered) |
 | `slack_team_thread` | 팀 스레드 읽기/답장 |
 | `slack_team_status` | 팀 현황/멤버 목록 조회 |
 | `slack_team_broadcast` | 팀 전체 브로드캐스트 |
 | `slack_team_report` | 팀원이 메인 채널 + 팀 채널에 작업 상황 보고 (팀 메모리 없을 시 SQLite fallback) |
 | `slack_team_close` | 채널 아카이브 + 최종 요약 + 태스크 일괄 완료 |
 | `slack_mention_check` | @멘션 수신 확인 — 멤버 ID·역할·페르소나 이름으로 멘션 큐 조회 (peek 모드 지원) |
+| `slack_check_all_notifications` | 모든 알림 통합 확인 — 멘션, 권한요청, 팀 미읽, 메인채널 (0 API 호출, SQLite만 사용) |
+| `slack_team_update_message` | 팀 채널에서 자신이 보낸 메시지 수정 (상태 업데이트, 결과 추가) |
+| `slack_team_delete_message` | 팀 채널에서 자신이 보낸 메시지 삭제 (잘못된/중복 메시지 정리) |
 
-### 팀 컨텍스트 관리 (7개)
+### 팀 컨텍스트 관리 (8개)
 
 > SQLite 기반 영구 저장소. 컨텍스트 압축(compaction) 후에도 유지되어 **~92% 토큰 절감**.
 
@@ -303,6 +304,7 @@ Slack App → OAuth & Permissions → Bot Token Scopes:
 | `slack_team_get_context` | **압축 후 즉시 복구** — 태스크 + 결정 + 스냅샷 원샷 반환 |
 | `slack_team_log_decision` | 의사결정 영구 기록 (승인/설계/우선순위/차단) |
 | `slack_team_decisions` | 의사결정 이력 조회 (중복 질문/승인 방지) |
+| `slack_whoami` | 🔑 compact/재시작 후 최우선 호출 — 모든 활성 팀·컨텍스트·태스크·워크플로우 한 번에 반환 |
 
 ### 승인/확인 (1개)
 
@@ -321,11 +323,11 @@ Slack App → OAuth & Permissions → Bot Token Scopes:
 
 | 도구 | 설명 |
 |------|------|
-| `slack_save_state` | 루프/팀 상태를 파일에 저장 (세션 복구용) |
+| `slack_save_state` | 루프/팀 상태를 SQLite에 저장 (세션 복구용) |
 | `slack_load_state` | 저장된 상태 복원 + 팀 컨텍스트 요약 포함 |
 | `slack_cost_report` | ccusage로 Claude Code 토큰/비용 보고 (일별/월별) |
 
-### 대시보드 + 운영 (10개)
+### 대시보드 + 운영 (11개)
 
 | 도구 | 설명 |
 |------|------|
@@ -337,8 +339,9 @@ Slack App → OAuth & Permissions → Bot Token Scopes:
 | `slack_pin_message` | 메시지 고정/해제 |
 | `slack_send_dm` | 다이렉트 메시지(DM) 전송 |
 | `slack_schedule_message` | 예약 시간에 메시지 전송 (리마인더, 정기 보고) |
-| `slack_team_request_permission` | 팀원→리더 권한 요청 + 리액션/텍스트 응답 대기 |
+| `slack_team_request_permission` | 팀원→리더 위험 작업 승인 요청 (기본 작업 자동 허용, staggered 폴링) |
 | `slack_list_permissions` | 대기 중인 권한 요청 목록 조회 |
+| `slack_resolve_permission` | 리더/서브리더가 팀원 권한 요청 승인/거부 (DB 결정 → 요청자 자동 감지) |
 
 ## 사용 예시
 
@@ -501,9 +504,10 @@ MCP 서버는 메시지 길이에 따라 최적의 전송 방식을 자동 선�
 
 ## 상태 관리 + 영구 컨텍스트
 
-### 파일 기반 상태 (state.json)
-- **루프 상태**: 활성 여부, 채널, 마지막 처리 ts, 작업 컨텍스트
-- **팀 레지스트리**: 팀 ID, 채널, 멤버 목록 및 상태
+### 파일 기반 상태 (state.json → SQLite)
+- 레거시 state.json은 최초 시작 시 자동 마이그레이션 (state.json.migrated로 리네임)
+- **루프 상태**: kv_store 테이블에 저장
+- **팀 레지스트리**: teams + team_members 테이블에 저장
 
 ### SQLite 영구 저장소 (slack_mcp.db)
 
@@ -516,6 +520,8 @@ MCP 서버는 메시지 길이에 따라 최적의 전송 방식을 자동 선�
 | `agent_context` | 에이전트별 컨텍스트 스냅샷 | 영구 |
 | `team_decisions` | 의사결정 이력 (승인, 설계, 우선순위) | 영구 |
 | `cost_reports` | Claude Code 비용 보고 이력 | 영구 |
+| `team_members` | 팀 멤버 목록 (state.json 대체) | 영구 |
+| `teams` | 팀 레지스트리 (state.json 대체) | 영구 |
 | `agent_heartbeats` | 에이전트 생존 신호 추적 | 영구 |
 | `scheduled_messages` | 예약 메시지 기록 | 영구 |
 | `permission_requests` | 팀 권한 요청 이력 | 영구 |
@@ -529,8 +535,8 @@ MCP 서버는 메시지 길이에 따라 최적의 전송 방식을 자동 선�
   slack_save_state(task_context: "현재 작업 설명")
 
 압축 후 (즉시 복구 — Slack 히스토리 재읽기 불필요):
-  slack_load_state()           → 팀 구조 + 태스크 현황 요약
-  slack_team_get_context()     → 내 태스크 + 결정 이력 + 컨텍스트 스냅샷
+  slack_whoami(agent_id)       → 모든 팀+태스크+컨텍스트+워크플로우 원샷 반환
+  slack_load_state()           → 루프 상태 복원
   slack_command_loop(since_ts) → 루프 재개
 ```
 

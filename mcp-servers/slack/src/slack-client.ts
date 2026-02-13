@@ -5,6 +5,7 @@
 import { WebClient } from "@slack/web-api";
 import { SLACK_BOT_TOKEN, SLACK_MSG_LIMIT, SLACK_FILE_THRESHOLD } from "./types.js";
 import { addWatchedThread } from "./db.js";
+import { rateLimitedCall } from "./rate-limiter.js";
 
 // ── Client Initialization ──────────────────────────────────────
 
@@ -13,11 +14,51 @@ if (!SLACK_BOT_TOKEN) {
   process.exit(1);
 }
 
-export const slack = new WebClient(SLACK_BOT_TOKEN, {
+const rawSlack = new WebClient(SLACK_BOT_TOKEN, {
   headers: {
     "User-Agent": "slack-mcp-server/1.0.0",
   },
 });
+
+/**
+ * Rate-limited Slack client proxy.
+ * All API method calls are wrapped with rateLimitedCall to prevent 429 errors.
+ * Usage is identical to the raw WebClient.
+ */
+export const slack = new Proxy(rawSlack, {
+  get(target, prop, receiver) {
+    const value = Reflect.get(target, prop, receiver);
+
+    // Wrap ALL top-level API methods through rate limiter.
+    // E.g. filesUploadV2, apiCall, etc.
+    if (typeof value === "function") {
+      const name = String(prop);
+      // Skip internal/utility methods that shouldn't be rate-limited
+      if (name.startsWith("_") || name === "constructor" || name === "toString"
+          || name === "valueOf" || name === "toJSON") {
+        return value;
+      }
+      return (...args: unknown[]) =>
+        rateLimitedCall(() => (value as Function).apply(target, args), name);
+    }
+
+    if (typeof value !== "object" || value === null) return value;
+
+    // Wrap API namespace objects (e.g., slack.chat, slack.conversations)
+    return new Proxy(value, {
+      get(nsTarget: Record<string, unknown>, nsProp: string) {
+        const method = nsTarget[nsProp];
+        if (typeof method !== "function") return method;
+
+        return (...args: unknown[]) =>
+          rateLimitedCall(
+            () => (method as Function).apply(nsTarget, args),
+            `${String(prop)}.${nsProp}`,
+          );
+      },
+    });
+  },
+}) as WebClient;
 
 // Bot user ID (resolved on startup)
 let botUserId: string | undefined;
@@ -70,13 +111,17 @@ export async function sendSmart(
     let firstTs = "";
     for (let i = 0; i < chunks.length; i++) {
       const prefix = chunks.length > 1 ? `_(${i + 1}/${chunks.length})_\n` : "";
+      // After first chunk: continue in thread of first chunk (or original thread)
+      const chunkThreadTs = i === 0
+        ? options?.thread_ts
+        : (firstTs || options?.thread_ts || undefined);
       const result = await slack.chat.postMessage({
         channel,
         text: prefix + chunks[i],
-        thread_ts: i === 0 ? options?.thread_ts : (firstTs || options?.thread_ts),
+        thread_ts: chunkThreadTs,
         mrkdwn: true,
       });
-      if (i === 0) firstTs = result.ts || "";
+      if (i === 0 && result.ts) firstTs = result.ts;
     }
     // Track the first chunk for thread monitoring
     if (firstTs) addWatchedThread(channel, options?.thread_ts || firstTs, "sendSmart:chunked");

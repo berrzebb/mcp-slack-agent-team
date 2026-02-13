@@ -158,7 +158,8 @@ export function registerBasicTools(server: McpServer): void {
 
       if (sorted.length > 0) {
         inboxIngest(ch, sorted);
-        inboxMarkAllRead(ch, "read_messages");
+        // Don't mark as read — other agents may still need these messages.
+        // Only update cursor so future reads start from here.
         setChannelCursor(ch, sorted[sorted.length - 1].ts);
       }
 
@@ -202,10 +203,10 @@ export function registerBasicTools(server: McpServer): void {
 
   server.tool(
     "slack_add_reaction",
-    "메시지에 이모지 리액션을 추가합니다. 명령 수신 확인(👀), 작업 완료(✅) 등의 시그널에 사용.",
+    "메시지에 이모지 리액션을 추가합니다. 상황에 맞는 리액션을 능동적으로 사용하세요: 👀 확인중, ✅ 완료, 🚀 시작, 🔥 긴급, 💡 아이디어, ⏳ 진행중, 🎉 축하, 👍 동의, ❌ 실패, 🔧 수정중, 📝 검토중, ⚡ 빠른처리 등. 자유롭게 적절한 이모지를 선택하세요.",
     {
       timestamp: z.string().describe("리액션을 달 메시지의 타임스탬프 (ts)"),
-      reaction: z.string().default("eyes").describe("이모지 이름 (콜론 없이). 예: eyes, white_check_mark, rocket"),
+      reaction: z.string().default("eyes").describe("이모지 이름 (콜론 없이). 예: eyes, white_check_mark, rocket, fire, bulb, hourglass_flowing_sand, tada, thumbsup, x, wrench, memo, zap"),
       channel: z.string().optional().describe("Slack 채널 ID (미지정 시 기본 채널 사용)"),
     },
     async ({ timestamp, reaction, channel }) => {
@@ -224,6 +225,36 @@ export function registerBasicTools(server: McpServer): void {
 
       return {
         content: [{ type: "text", text: `✅ :${reaction}: 리액션 추가 완료 (ts: ${timestamp})` }],
+      };
+    }
+  );
+
+  // ── slack_remove_reaction ────────────────────────────────────
+
+  server.tool(
+    "slack_remove_reaction",
+    "메시지에서 이모지 리액션을 제거합니다. 상태 변경 시 이전 리액션을 정리하세요: ⏳→✅ (진행→완료), 👀→✅ (확인→완료) 등.",
+    {
+      timestamp: z.string().describe("리액션을 제거할 메시지의 타임스탬프 (ts)"),
+      reaction: z.string().describe("제거할 이모지 이름 (콜론 없이). 예: eyes, hourglass_flowing_sand"),
+      channel: z.string().optional().describe("Slack 채널 ID (미지정 시 기본 채널 사용)"),
+    },
+    async ({ timestamp, reaction, channel }) => {
+      const ch = resolveChannel(channel);
+      try {
+        await slack.reactions.remove({ channel: ch, name: reaction, timestamp });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes("no_reaction")) {
+          return {
+            content: [{ type: "text", text: `ℹ️ :${reaction}: 리액션이 존재하지 않음 (ts: ${timestamp})` }],
+          };
+        }
+        throw err;
+      }
+
+      return {
+        content: [{ type: "text", text: `✅ :${reaction}: 리액션 제거 완료 (ts: ${timestamp})` }],
       };
     }
   );

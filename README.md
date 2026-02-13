@@ -18,23 +18,23 @@ mcp-servers/slack/                 # Slack MCP 서버
 │   ├── background-poller.ts       #   백그라운드 메시지 수집기 (10초 간격)
 │   ├── types.ts                   #   인터페이스, 상수, 타입 정의 + 에이전트 페르소나
 │   ├── db.ts                      #   SQLite 초기화 + 데이터 접근 헬퍼
-│   ├── state.ts                   #   JSON 상태 관리 + 팀 레지스트리
+│   ├── state.ts                   #   SQLite 기반 상태 관리 + 팀 레지스트리
 │   ├── slack-client.ts            #   WebClient + sendSmart + 메시지 분할
 │   ├── formatting.ts              #   메시지 포맷 + 리치 포맷팅 유틸리티
 │   ├── rate-limiter.ts             #   중앙집중 Rate Limiter (토큰 버킷 + 자동 백오프)
 │   ├── approval-hook.ts           #   범용 Slack 승인 훅 (Bash + 도구 + 권한)
 │   ├── test.ts                    #   연결 테스트
 │   ├── check.ts                   #   간단한 연결 확인
-│   └── tools/                     #   도구 모듈 (총 49개)
-│       ├── basic.ts               #     기본 통신 + 응답 + 진단 (10개)
+│   └── tools/                     #   도구 모듈 (총 55개)
+│       ├── basic.ts               #     기본 통신 + 리액션 관리 + 진단 (11개)
 │       ├── content.ts             #     코드/스니펫 업로드 (2개)
 │       ├── loop.ts                #     명령 루프 + 인박스 + 리액션 커맨드 (3개)
-│       ├── team.ts                #     팀 관리 + 페르소나 멘션 (11개)
-│       ├── context.ts             #     팀 컨텍스트 관리 (7개)
+│       ├── team.ts                #     팀 관리 + 멘션 + 알림 통합 (14개)
+│       ├── context.ts             #     팀 컨텍스트 관리 + whoami (8개)
 │       ├── approval.ts            #     승인 요청 (1개)
 │       ├── file.ts                #     파일 다운로드/업로드 (2개)
 │       ├── state.ts               #     상태 저장/복원 + 비용 보고 (3개)
-│       └── dashboard.ts           #     대시보드 + 하트비트 + DM + 예약/검색 (10개)
+│       └── dashboard.ts           #     대시보드 + 하트비트 + DM + 예약/권한 (11개)
 ├── package.json
 ├── tsconfig.json
 └── .env.example
@@ -44,11 +44,13 @@ mcp-servers/slack/                 # Slack MCP 서버
 
 - **원격 제어** — Slack에서 명령 입력 → 에이전트 실행 → 결과를 스레드로 회신
 - **명령 루프** — `slack_command_loop`로 채팅 인터페이스를 완전히 대체
+- **논블로킹 체크** — `slack_command_loop(timeout=0)`, `slack_team_wait(timeout=0)`으로 작업 중 Slack 명령 놓침 방지
 - **멀티 에이전트 팀** — 전용 채널 생성, 역할별 이름/아이콘, 브로드캐스트, 아카이브
 - **에이전트 페르소나** — 12종 named persona (Aria, Sage, Forge 등) — 역할별 고유 이름/이모지 자동 표시
 - **@멘션 시스템** — 페르소나 이름·역할·멤버 ID로 @멘션 → 멘션 큐에 저장 → 수신자 확인
 - **리액션-커맨드** — Slack 이모지 리액션(✅❌🚀🔄🗑️❓)을 커맨드로 자동 변환
 - **백그라운드 수집** — 10초 간격 자동 메시지 폴링, 도구 호출 없이도 Slack 메시지 유실 방지
+- **멀티프로세스 안전** — SQLite WAL + busy_timeout + 폴러 DB 리스 + 팀별 개별 저장
 - **영구 컨텍스트 관리** — SQLite 기반 태스크/의사결정/에이전트 컨텍스트 저장, 컨텍스트 압축 후 즉시 복구
 - **핫 리로드** — `slack_reload`로 코드 빌드 + 서버 재시작, `wrapper.js`로 Claude Code 연결 유지
 - **범용 승인 훅** — Bash 명령 + MCP 도구 + 권한 요청 모두 지원, 안전 명령 자동 바이패스
@@ -111,19 +113,19 @@ npx tsx src/test.ts
     │                            └── 다음 명령 대기
 ```
 
-## 제공 도구 (49개)
+## 제공 도구 (55개)
 
 | 카테고리 | 도구 |
 |----------|------|
-| **기본 통신 + 응답** (10) | `slack_send_message`, `slack_respond`, `slack_update_message`, `slack_read_messages`, `slack_reply_thread`, `slack_add_reaction`, `slack_list_channels`, `slack_get_thread`, `slack_reload`, `slack_inbox_status` |
+| **기본 통신 + 리액션** (11) | `slack_send_message`, `slack_respond`, `slack_update_message`, `slack_read_messages`, `slack_reply_thread`, `slack_add_reaction`, `slack_remove_reaction`, `slack_list_channels`, `slack_get_thread`, `slack_reload`, `slack_inbox_status` |
 | **컨텐츠** (2) | `slack_upload_snippet`, `slack_send_code` |
 | **명령 루프 + 인박스** (3) | `slack_command_loop`, `slack_check_inbox`, `slack_wait_for_reply` |
-| **팀 관리** (11) | `slack_team_create`, `slack_team_register`, `slack_team_send`, `slack_team_read`, `slack_team_wait`, `slack_team_thread`, `slack_team_status`, `slack_team_broadcast`, `slack_team_report`, `slack_team_close`, `slack_mention_check` |
-| **팀 컨텍스트** (7) | `slack_team_assign_task`, `slack_team_update_task`, `slack_team_list_tasks`, `slack_team_save_context`, `slack_team_get_context`, `slack_team_log_decision`, `slack_team_decisions` |
+| **팀 관리 + 알림** (14) | `slack_team_create`, `slack_team_register`, `slack_team_send`, `slack_team_read`, `slack_team_wait`, `slack_team_thread`, `slack_team_status`, `slack_team_broadcast`, `slack_team_report`, `slack_team_close`, `slack_mention_check`, `slack_check_all_notifications`, `slack_team_update_message`, `slack_team_delete_message` |
+| **팀 컨텍스트** (8) | `slack_team_assign_task`, `slack_team_update_task`, `slack_team_list_tasks`, `slack_team_save_context`, `slack_team_get_context`, `slack_team_log_decision`, `slack_team_decisions`, `slack_whoami` |
 | **승인** (1) | `slack_request_approval` |
 | **파일** (2) | `slack_download_file`, `slack_upload_file` |
 | **상태 + 비용** (3) | `slack_save_state`, `slack_load_state`, `slack_cost_report` |
-| **대시보드 + 운영** (10) | `slack_progress_dashboard`, `slack_heartbeat`, `slack_heartbeat_status`, `slack_thread_summary`, `slack_search_inbox`, `slack_pin_message`, `slack_send_dm`, `slack_schedule_message`, `slack_team_request_permission`, `slack_list_permissions` |
+| **대시보드 + 운영** (11) | `slack_progress_dashboard`, `slack_heartbeat`, `slack_heartbeat_status`, `slack_thread_summary`, `slack_search_inbox`, `slack_pin_message`, `slack_send_dm`, `slack_schedule_message`, `slack_team_request_permission`, `slack_list_permissions`, `slack_resolve_permission` |
 
 ## 필요한 Slack Bot Token Scopes
 

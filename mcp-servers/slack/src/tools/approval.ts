@@ -80,15 +80,17 @@ export function registerApprovalTools(server: McpServer): void {
         }
       }
 
-      // 폴링: 리액션 또는 스레드 답장 확인
+      // 폴링: 리액션 또는 스레드 답장 확인 (staggered — 1 API call/cycle instead of 2)
       const deadline = Date.now() + timeout_seconds * 1000;
       const interval = poll_interval_seconds * 1000;
+      let approvalCycle = 0;
 
       while (Date.now() < deadline) {
+        approvalCycle++;
         await sleep(interval);
 
-        // 1) 리액션 확인
-        try {
+        // 1) 리액션 확인 (odd cycles)
+        if (approvalCycle % 2 === 1) try {
           const reactResult = await slack.reactions.get({
             channel: ch,
             timestamp: approvalTs,
@@ -96,25 +98,11 @@ export function registerApprovalTools(server: McpServer): void {
           });
 
           const reactions = (reactResult.message as { reactions?: Array<{ name: string; users?: string[] }> })?.reactions || [];
+          // Deny takes priority over approve for safety
+          let hasApprove: { name: string; user: string } | null = null;
           for (const r of reactions) {
             const nonBotUsers = (r.users || []).filter((u) => u !== myUserId);
             if (nonBotUsers.length === 0) continue;
-
-            if (["white_check_mark", "+1", "heavy_check_mark", "thumbsup"].includes(r.name)) {
-              await slack.reactions.add({ channel: ch, name: "white_check_mark", timestamp: approvalTs }).catch(() => {});
-              // Auto-log decision
-              if (team_id) logDecision({ team_id, decision_type: "approval", question: title, answer: `승인됨 (리액션 :${r.name}:)`, decided_by: nonBotUsers[0] });
-              return {
-                content: [{
-                  type: "text",
-                  text: JSON.stringify({
-                    ok: true, approved: true, method: "reaction",
-                    reaction: r.name, user: nonBotUsers[0],
-                    approval_ts: approvalTs, message: `✅ 승인됨 (:${r.name}: 리액션)`,
-                  }, null, 2),
-                }],
-              };
-            }
 
             if (["x", "-1", "no_entry", "thumbsdown", "no_entry_sign"].includes(r.name)) {
               await slack.reactions.add({ channel: ch, name: "x", timestamp: approvalTs }).catch(() => {});
@@ -130,13 +118,31 @@ export function registerApprovalTools(server: McpServer): void {
                 }],
               };
             }
+
+            if (["white_check_mark", "+1", "heavy_check_mark", "thumbsup"].includes(r.name)) {
+              hasApprove = { name: r.name, user: nonBotUsers[0] };
+            }
+          }
+          if (hasApprove) {
+            await slack.reactions.add({ channel: ch, name: "white_check_mark", timestamp: approvalTs }).catch(() => {});
+            if (team_id) logDecision({ team_id, decision_type: "approval", question: title, answer: `승인됨 (리액션 :${hasApprove.name}:)`, decided_by: hasApprove.user });
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  ok: true, approved: true, method: "reaction",
+                  reaction: hasApprove.name, user: hasApprove.user,
+                  approval_ts: approvalTs, message: `✅ 승인됨 (:${hasApprove.name}: 리액션)`,
+                }, null, 2),
+              }],
+            };
           }
         } catch {
           // reactions.get 실패 시 무시
         }
 
-        // 2) 스레드 텍스트 답장 확인
-        try {
+        // 2) 스레드 텍스트 답장 확인 (even cycles)
+        if (approvalCycle % 2 === 0) try {
           const threadResult = await slack.conversations.replies({
             channel: ch,
             ts: approvalTs,
@@ -151,11 +157,13 @@ export function registerApprovalTools(server: McpServer): void {
             const latest = replies[replies.length - 1];
             const text = (latest.text || "").toLowerCase().trim();
 
-            const approvePatterns = ["승인", "확인", "진행", "ㅇㅇ", "ㄱㄱ", "ok", "yes", "approve", "approved", "lgtm", "go", "proceed"];
-            const denyPatterns = ["거부", "거절", "중단", "취소", "ㄴㄴ", "no", "deny", "denied", "reject", "stop", "cancel", "abort"];
+            // Use exact word matching to avoid false positives (e.g. "token" matching "ok")
+            const approveExact = ["승인", "확인", "진행", "ㅇㅇ", "ㄱㄱ", "ok", "yes", "approve", "approved", "lgtm", "go", "proceed"];
+            const denyExact = ["거부", "거절", "중단", "취소", "ㄴㄴ", "no", "deny", "denied", "reject", "stop", "cancel", "abort"];
 
-            const isApproved = approvePatterns.some((p) => text.includes(p));
-            const isDenied = denyPatterns.some((p) => text.includes(p));
+            // Check deny first (deny takes priority when both match)
+            const isDenied = denyExact.some((p) => text === p || text.startsWith(p + " ") || text.startsWith(p + "."));
+            const isApproved = !isDenied && approveExact.some((p) => text === p || text.startsWith(p + " ") || text.startsWith(p + "."));
 
             if (isApproved || isDenied) {
               const emoji = isApproved ? "white_check_mark" : "x";

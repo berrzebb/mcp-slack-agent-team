@@ -11,13 +11,67 @@
  */
 
 import type { SlackMessage } from "./types.js";
-import { SLACK_DEFAULT_CHANNEL } from "./types.js";
+import { SLACK_DEFAULT_CHANNEL, AGENT_PERSONAS } from "./types.js";
 import { slack, resolveBotUserId } from "./slack-client.js";
 import {
-  inboxIngest, getChannelCursor, setChannelCursor,
-  getWatchedThreads,
+  db, inboxIngest, getChannelCursor, setChannelCursor,
+  getWatchedThreads, pushMentionQueue,
 } from "./db.js";
-import { teams } from "./state.js";
+import { teams, ensureTeamsLoaded } from "./state.js";
+
+// ── Poller Leadership (DB-based lease) ─────────────────────────
+// Only ONE MCP server process should run the background poller.
+// Multiple processes (leader + teammates) all start the same code,
+// so we use a DB-based lease to elect a single poller leader.
+// Lease TTL = 30s; holder must renew each cycle; stale lease = takeover.
+
+const POLLER_LEASE_KEY = "bg_poller_lease";
+const POLLER_LEASE_TTL_MS = 30_000;
+
+function tryAcquirePollerLease(): boolean {
+  try {
+    const myPid = process.pid.toString();
+    const row = db.prepare(
+      "SELECT value, updated_at FROM kv_store WHERE key = ?"
+    ).get(POLLER_LEASE_KEY) as { value: string; updated_at: string } | undefined;
+
+    if (row) {
+      // SQLite datetime('now') returns UTC but without 'Z' → "YYYY-MM-DD HH:MM:SS"
+      // Ensure proper UTC parsing regardless of local timezone
+      const utcStr = row.updated_at.replace(" ", "T") + (row.updated_at.endsWith("Z") ? "" : "Z");
+      const leaseAge = Date.now() - new Date(utcStr).getTime();
+      if (leaseAge >= 0 && leaseAge < POLLER_LEASE_TTL_MS && row.value !== myPid) {
+        return false; // Another process holds a fresh lease
+      }
+    }
+
+    // Acquire or renew lease
+    db.prepare(`
+      INSERT INTO kv_store (key, value, updated_at) VALUES (?, ?, datetime('now'))
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')
+    `).run(POLLER_LEASE_KEY, myPid);
+
+    return true;
+  } catch (err) {
+    console.error("[bg-poller] Lease acquisition failed:", err);
+    return false;
+  }
+}
+
+function renewPollerLease(): void {
+  try {
+    db.prepare(
+      "UPDATE kv_store SET updated_at = datetime('now') WHERE key = ? AND value = ?"
+    ).run(POLLER_LEASE_KEY, process.pid.toString());
+  } catch { /* best effort */ }
+}
+
+function releasePollerLease(): void {
+  try {
+    db.prepare("DELETE FROM kv_store WHERE key = ? AND value = ?")
+      .run(POLLER_LEASE_KEY, process.pid.toString());
+  } catch { /* best effort */ }
+}
 
 // ── Configuration ──────────────────────────────────────────────
 
@@ -33,6 +87,9 @@ async function pollOnce(): Promise<void> {
   if (isPolling) return; // prevent overlap
   isPolling = true;
 
+  // Renew lease so other processes know this poller is alive
+  renewPollerLease();
+
   try {
     const myUserId = await resolveBotUserId();
     if (!myUserId) return;
@@ -40,6 +97,7 @@ async function pollOnce(): Promise<void> {
     // Collect channels to poll: default + all team channels
     const channels = new Set<string>();
     if (SLACK_DEFAULT_CHANNEL) channels.add(SLACK_DEFAULT_CHANNEL);
+    ensureTeamsLoaded();
     for (const team of teams.values()) {
       if (team.status === "active" && team.channelId) {
         channels.add(team.channelId);
@@ -79,8 +137,9 @@ async function pollChannel(ch: string, myUserId: string): Promise<void> {
 
   let messages = (result.messages || []) as SlackMessage[];
   if (cursor) messages = messages.filter((m) => m.ts !== cursor);
-  // Keep all messages including bot's own — inbox deduplication handles it
-  const userMessages = messages.filter((m) => m.user !== myUserId);
+  // Ingest ALL messages including bot's own (team_report, team_send use bot identity).
+  // Filtering is done at READ time (check_inbox, command_loop), not at WRITE time.
+  const userMessages = messages;
 
   // 2. Watched threads for this channel
   const watchedThreads = getWatchedThreads(ch);
@@ -98,8 +157,7 @@ async function pollChannel(ch: string, myUserId: string): Promise<void> {
         limit: 10,
       });
       const threadReplies = ((threadResult.messages || []) as SlackMessage[])
-        .filter((m) => m.ts !== wt.thread_ts && (!cursor || m.ts > cursor))
-        .filter((m) => m.user !== myUserId);
+        .filter((m) => m.ts !== wt.thread_ts && (!cursor || m.ts > cursor));
       for (const r of threadReplies) {
         if (!r.thread_ts) r.thread_ts = wt.thread_ts;
       }
@@ -120,9 +178,88 @@ async function pollChannel(ch: string, myUserId: string): Promise<void> {
     const inserted = inboxIngest(ch, deduped);
     if (inserted > 0) {
       console.error(`[bg-poller] ${ch}: +${inserted} new messages ingested`);
+      // Scan for @mentions and route to mention queues
+      scanAndRouteMentions(ch, deduped, myUserId);
     }
     const latestTs = deduped.reduce((max, m) => m.ts > max ? m.ts : max, deduped[0].ts);
     setChannelCursor(ch, latestTs);
+  }
+}
+
+// ── Mention Auto-Routing ───────────────────────────────────────
+
+/**
+ * Scan newly ingested messages for @persona mentions and route to mention queues.
+ * This ensures that even messages from human users or other channels are captured
+ * in the mention queue system, so agents can discover them via slack_mention_check
+ * or slack_check_all_notifications.
+ *
+ * Detects patterns: *@PersonaName*, @PersonaName, @role-name, @memberId
+ */
+function scanAndRouteMentions(ch: string, messages: SlackMessage[], botUserId: string): void {
+  // Build a lookup of all known names → member IDs
+  const nameToMemberIds = new Map<string, Array<{ memberId: string; teamId: string; role: string }>>();
+
+  for (const [teamId, team] of teams) {
+    if (team.status !== "active") continue;
+    for (const [memberId, member] of team.members) {
+      // Index by memberId, role, and persona displayName
+      const keys = [memberId.toLowerCase(), member.role.toLowerCase()];
+      const persona = AGENT_PERSONAS[member.role];
+      if (persona) keys.push(persona.displayName.toLowerCase());
+
+      for (const key of keys) {
+        const existing = nameToMemberIds.get(key) || [];
+        // Avoid duplicates
+        if (!existing.some(e => e.memberId === memberId && e.teamId === teamId)) {
+          existing.push({ memberId, teamId, role: member.role });
+          nameToMemberIds.set(key, existing);
+        }
+      }
+    }
+  }
+
+  if (nameToMemberIds.size === 0) return;
+
+  // Scan each message for mentions
+  for (const msg of messages) {
+    if (!msg.text || msg.user === botUserId) continue;
+
+    const text = msg.text;
+    // Match patterns: *@Name*, @Name, or just persona names in bold
+    const mentionPattern = /(?:\*@?|@)([a-zA-Z][a-zA-Z0-9_-]*)\*?/g;
+    let match: RegExpExecArray | null;
+    const mentionedMembers = new Set<string>();
+
+    while ((match = mentionPattern.exec(text)) !== null) {
+      const name = match[1].toLowerCase();
+      const targets = nameToMemberIds.get(name);
+      if (!targets) continue;
+
+      for (const target of targets) {
+        const key = `${target.teamId}:${target.memberId}`;
+        if (mentionedMembers.has(key)) continue;
+        mentionedMembers.add(key);
+
+        const notice = JSON.stringify({
+          from: msg.user || "unknown",
+          from_id: msg.user || "unknown",
+          message: text.substring(0, 200),
+          thread_ts: msg.thread_ts || msg.ts,
+          channel: ch,
+          team_id: target.teamId,
+          ts: new Date().toISOString(),
+          type: "auto_detected",
+        });
+
+        // Queue by memberId and role
+        for (const queueKey of [target.memberId, target.role]) {
+          try {
+            pushMentionQueue(queueKey, notice);
+          } catch { /* concurrent write — best effort */ }
+        }
+      }
+    }
   }
 }
 
@@ -131,7 +268,12 @@ async function pollChannel(ch: string, myUserId: string): Promise<void> {
 export function startBackgroundPoller(): void {
   if (pollerHandle) return;
 
-  console.error(`[bg-poller] Starting (interval: ${POLL_INTERVAL_MS}ms)`);
+  if (!tryAcquirePollerLease()) {
+    console.error(`[bg-poller] Another process holds the poller lease — skipping (pid: ${process.pid})`);
+    return;
+  }
+
+  console.error(`[bg-poller] Starting (interval: ${POLL_INTERVAL_MS}ms, pid: ${process.pid})`);
 
   // Initial poll after 3s (let server finish startup)
   setTimeout(() => {
@@ -152,6 +294,7 @@ export function stopBackgroundPoller(): void {
   if (pollerHandle) {
     clearInterval(pollerHandle);
     pollerHandle = null;
+    releasePollerLease();
     console.error("[bg-poller] Stopped");
   }
 }

@@ -8,7 +8,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type {
   LoopState, CcusageDailyResult, CcusageMonthlyResult, CcusageTotals,
 } from "../types.js";
-import { SLACK_DEFAULT_CHANNEL, STATE_FILE } from "../types.js";
+import { SLACK_DEFAULT_CHANNEL, DB_FILE } from "../types.js";
 import { teams, loadState, saveState, saveTeamsToState, restoreTeamsFromState, agentIdentity } from "../state.js";
 import { slack } from "../slack-client.js";
 import { saveCostReport, getTeamTasks, getTeamContexts, getRecentDecisions } from "../db.js";
@@ -54,7 +54,7 @@ export function registerStateTools(server: McpServer): void {
 
   server.tool(
     "slack_save_state",
-    "현재 Slack 루프 상태를 파일에 저장합니다. compact/재시작 후 복구에 사용. 중요한 시점마다 호출하세요.",
+    "현재 Slack 루프 상태를 SQLite에 저장합니다. compact/재시작 후 복구에 사용. 중요한 시점마다 호출하세요.",
     {
       channel: z.string().optional().describe("현재 대기 중인 채널 ID"),
       last_ts: z.string().optional().describe("마지막으로 처리한 메시지 ts"),
@@ -76,7 +76,7 @@ export function registerStateTools(server: McpServer): void {
         content: [{
           type: "text",
           text: JSON.stringify(
-            { ok: true, state_file: STATE_FILE, loop: loopState, teams_saved: teams.size },
+            { ok: true, storage: "sqlite", db_file: DB_FILE, loop: loopState, teams_saved: teams.size },
             null, 2
           ),
         }],
