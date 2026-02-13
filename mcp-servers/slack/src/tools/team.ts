@@ -5,7 +5,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { SlackMessage, TeamMember } from "../types.js";
-import { SLACK_DEFAULT_CHANNEL } from "../types.js";
+import { SLACK_DEFAULT_CHANNEL, PERSONA_NAME_TO_ROLE, AGENT_PERSONAS } from "../types.js";
 import { db, saveAgentContext, getTeamTasks, updateTaskStatus } from "../db.js";
 import {
   teams, getTeam, resolveChannel,
@@ -14,6 +14,68 @@ import {
 } from "../state.js";
 import { slack, resolveBotUserId, sendSmart, sleep } from "../slack-client.js";
 import { formatMessages, getTeamWorkflowInstructions } from "../formatting.js";
+
+/**
+ * Resolve @mention targets to member IDs.
+ * Accepts: member ID ("implementer-A"), role ("planner"), or persona name ("@Sage", "Sage").
+ * Returns: { resolvedMemberIds: string[], displayNames: string[] }
+ */
+function resolvePersonaMentions(
+  mentions: string[],
+  teamMembers: Map<string, TeamMember>,
+): { resolvedIds: string[]; displayTags: string[] } {
+  const resolvedIds: string[] = [];
+  const displayTags: string[] = [];
+
+  for (const raw of mentions) {
+    const name = raw.replace(/^@/, "").trim();
+    const nameLower = name.toLowerCase();
+
+    // 1. Exact member ID match (e.g., "implementer-A")
+    if (teamMembers.has(name)) {
+      const persona = AGENT_PERSONAS[teamMembers.get(name)!.role];
+      displayTags.push(`*@${persona?.displayName || name}*`);
+      resolvedIds.push(name);
+      continue;
+    }
+
+    // 2. Persona display name → role → find member with that role
+    const role = PERSONA_NAME_TO_ROLE[nameLower];
+    if (role) {
+      const found = [...teamMembers.entries()].find(([, m]) => m.role === role);
+      if (found) {
+        const persona = AGENT_PERSONAS[role];
+        displayTags.push(`*@${persona?.displayName || name}*`);
+        resolvedIds.push(found[0]);
+        continue;
+      }
+    }
+
+    // 3. Role name match (e.g., "planner", "implementer")
+    const byRole = [...teamMembers.entries()].find(([, m]) => m.role === name || m.role === nameLower);
+    if (byRole) {
+      const persona = AGENT_PERSONAS[byRole[1].role];
+      displayTags.push(`*@${persona?.displayName || name}*`);
+      resolvedIds.push(byRole[0]);
+      continue;
+    }
+
+    // 4. Partial match on member ID prefix
+    const byPrefix = [...teamMembers.entries()].find(([id]) => id.startsWith(nameLower));
+    if (byPrefix) {
+      const persona = AGENT_PERSONAS[byPrefix[1].role];
+      displayTags.push(`*@${persona?.displayName || name}*`);
+      resolvedIds.push(byPrefix[0]);
+      continue;
+    }
+
+    // Fallback: use raw name
+    displayTags.push(`*@${name}*`);
+    resolvedIds.push(name);
+  }
+
+  return { resolvedIds, displayTags };
+}
 
 export function registerTeamTools(server: McpServer): void {
 
@@ -40,12 +102,45 @@ export function registerTeamTools(server: McpServer): void {
         .replace(/[^a-z0-9-]/g, "-")
         .slice(0, 80);
 
-      const createResult = await slack.conversations.create({
-        name: chName,
-        is_private,
-      });
+      let channelId: string | undefined;
+      let reused = false;
 
-      const channelId = createResult.channel?.id;
+      try {
+        const createResult = await slack.conversations.create({
+          name: chName,
+          is_private,
+        });
+        channelId = createResult.channel?.id;
+      } catch (err: unknown) {
+        const slackErr = err as { data?: { error?: string } };
+        if (slackErr.data?.error === "name_taken") {
+          // Channel already exists — find and reuse it
+          const listResult = await slack.conversations.list({
+            types: is_private ? "private_channel" : "public_channel",
+            limit: 1000,
+            exclude_archived: true,
+          });
+          const existing = (listResult.channels || []).find(
+            (c) => c.name === chName || c.name_normalized === chName,
+          );
+          if (existing?.id) {
+            channelId = existing.id;
+            reused = true;
+            // Unarchive if needed
+            if (existing.is_archived) {
+              await slack.conversations.unarchive({ channel: channelId }).catch(() => {});
+            }
+          } else {
+            // Fallback: append timestamp suffix
+            const suffixed = (chName + "-" + Date.now().toString(36)).slice(0, 80);
+            const retry = await slack.conversations.create({ name: suffixed, is_private });
+            channelId = retry.channel?.id;
+          }
+        } else {
+          throw err;
+        }
+      }
+
       if (!channelId) throw new Error("채널 생성 실패");
 
       await slack.conversations.setTopic({
@@ -85,7 +180,7 @@ export function registerTeamTools(server: McpServer): void {
           team_id,
           role: m.role,
           track: m.track,
-          context_snapshot: { goal: team_name, phase: "init" },
+          context_snapshot: { goal: team_name, phase: "init", channelId },
           last_updated: new Date().toISOString(),
         });
       }
@@ -124,7 +219,7 @@ export function registerTeamTools(server: McpServer): void {
             channel_name: chName,
             root_thread_ts: introMsg.ts,
             members_count: members.length,
-            message: `팀 채널 #${chName} 생성 완료`,
+            message: `팀 채널 #${chName} ${reused ? "재사용" : "생성"} 완료`,
             member_workflow_hint: "각 팀원 에이전트에게 아래 지시를 전달하세요: 작업 진행/완료 시 반드시 slack_team_send 또는 slack_team_report를 호출하여 팀 채널에 보고할 것.",
           }, null, 2),
         }],
@@ -164,7 +259,7 @@ export function registerTeamTools(server: McpServer): void {
         team_id,
         role,
         track,
-        context_snapshot: { phase: "joined" },
+        context_snapshot: { phase: "joined", channelId: team.channelId },
         last_updated: new Date().toISOString(),
       });
 
@@ -204,36 +299,58 @@ export function registerTeamTools(server: McpServer): void {
 
   server.tool(
     "slack_team_send",
-    "에이전트가 자신의 역할 이름으로 팀 채널에 메시지를 보냅니다. mention으로 다른 팀원을 @멘션할 수 있습니다.",
+    "에이전트가 자신의 역할 이름으로 팀 채널에 메시지를 보냅니다. mention으로 다른 팀원을 @페르소나이름 또는 @역할로 멘션할 수 있습니다. (예: ['@Sage', '@Forge', 'validator'])",
     {
       team_id: z.string().describe("팀 식별자"),
       sender: z.string().describe("보내는 멤버 ID (예: sub-leader-A, worker-A)"),
       message: z.string().describe("메시지 내용"),
-      mention: z.array(z.string()).optional().describe("멘션할 팀원 ID 목록 (예: ['worker-A', 'sub-leader-B']). 메시지 앞에 @멘션 태그가 추가됩니다."),
+      mention: z.array(z.string()).optional().describe("멘션할 대상 목록. @페르소나이름(@Sage, @Forge), 역할명(planner), 멤버ID(impl-A) 모두 가능."),
       thread_ts: z.string().optional().describe("스레드에 답장할 경우 해당 ts. 미지정 시 채널에 직접 전송."),
       update_status: z.enum(["active", "idle", "done"]).optional().describe("메시지 전송과 함께 멤버 상태 업데이트"),
     },
     async ({ team_id, sender, message, mention, thread_ts, update_status }) => {
-      const team = getTeam(team_id);
-      const member = team.members.get(sender);
-      if (!member) {
-        throw new Error(`멤버 '${sender}'가 팀 '${team_id}'에 등록되어 있지 않습니다.`);
+      let team: ReturnType<typeof getTeam> | null = null;
+      let member: TeamMember | undefined;
+      let channelId: string;
+
+      try {
+        team = getTeam(team_id);
+        member = team.members.get(sender);
+        channelId = team.channelId;
+      } catch {
+        const ctx = db.prepare(`SELECT context_snapshot FROM agent_context WHERE agent_id = ? AND team_id = ?`).get(sender, team_id) as { context_snapshot: string } | undefined;
+        const storedChannelId = ctx ? JSON.parse(ctx.context_snapshot)?.channelId : undefined;
+        channelId = storedChannelId || SLACK_DEFAULT_CHANNEL;
+        console.error(`[team_send] Team '${team_id}' not in memory, fallback to channel ${channelId}`);
       }
 
-      if (update_status) {
+      if (member && update_status) {
         member.status = update_status;
         saveTeamsToState();
       }
 
-      const mentionTags = mention && mention.length > 0
-        ? mention.map((m) => `*@${m}*`).join(" ") + " "
-        : "";
+      // Resolve @persona mentions to member IDs
+      let mentionTags = "";
+      let resolvedMentionIds: string[] = [];
+      if (mention && mention.length > 0 && team) {
+        const resolved = resolvePersonaMentions(mention, team.members);
+        mentionTags = resolved.displayTags.join(" ") + " ";
+        resolvedMentionIds = resolved.resolvedIds;
+      } else if (mention && mention.length > 0) {
+        mentionTags = mention.map((m) => `*@${m.replace(/^@/, "")}*`).join(" ") + " ";
+        resolvedMentionIds = mention.map((m) => m.replace(/^@/, ""));
+      }
 
       const statusTag = update_status === "done" ? " ✅" : "";
-      const identity = agentIdentity(sender, member);
+      const identity = member
+        ? agentIdentity(sender, member)
+        : { username: sender, icon_emoji: ":robot_face:" };
+
+      // Get sender's persona name for the mention notice
+      const senderPersona = member ? (AGENT_PERSONAS[member.role]?.displayName || sender) : sender;
 
       const result = await slack.chat.postMessage({
-        channel: team.channelId,
+        channel: channelId,
         text: `${statusTag ? statusTag + " " : ""}${mentionTags}${message}`,
         thread_ts,
         mrkdwn: true,
@@ -241,17 +358,38 @@ export function registerTeamTools(server: McpServer): void {
         icon_emoji: identity.icon_emoji,
       });
 
-      if (mention && mention.length > 0) {
-        const mentionNotice = `[멘션 알림] ${sender}가 당신을 멘션했습니다: ${message.substring(0, 100)}`;
-        for (const targetId of mention) {
+      // Store mention notifications in both member ID and role queues
+      if (resolvedMentionIds.length > 0 && team) {
+        for (const targetId of resolvedMentionIds) {
           const targetMember = team.members.get(targetId);
+          const mentionNotice = JSON.stringify({
+            from: senderPersona,
+            from_id: sender,
+            message: message.substring(0, 200),
+            thread_ts: result.ts,
+            channel: channelId,
+            team_id,
+            ts: new Date().toISOString(),
+          });
+
+          // Queue by member ID
+          db.prepare(
+            `INSERT INTO kv_store (key, value) VALUES (?, ?)
+             ON CONFLICT(key) DO UPDATE SET value = json_insert(value, '$[#]', json(?)), updated_at = datetime('now')`
+          ).run(
+            `mention_queue:${targetId}`,
+            JSON.stringify([JSON.parse(mentionNotice)]),
+            mentionNotice,
+          );
+
+          // Also queue by role (so agents can check by their role name)
           if (targetMember) {
             db.prepare(
               `INSERT INTO kv_store (key, value) VALUES (?, ?)
-               ON CONFLICT(key) DO UPDATE SET value = json_insert(value, '$[#]', ?), updated_at = datetime('now')`
+               ON CONFLICT(key) DO UPDATE SET value = json_insert(value, '$[#]', json(?)), updated_at = datetime('now')`
             ).run(
-              `mention_queue:${targetId}`,
-              JSON.stringify([mentionNotice]),
+              `mention_queue:${targetMember.role}`,
+              JSON.stringify([JSON.parse(mentionNotice)]),
               mentionNotice,
             );
           }
@@ -264,10 +402,79 @@ export function registerTeamTools(server: McpServer): void {
           text: JSON.stringify({
             ok: true,
             ts: result.ts,
-            channel: team.channelId,
+            channel: channelId,
             sender,
-            mentioned: mention || [],
-            status: member.status,
+            mentioned: resolvedMentionIds,
+            status: member?.status || "unknown",
+          }, null, 2),
+        }],
+      };
+    }
+  );
+
+  // ── slack_mention_check ──────────────────────────────────────
+
+  server.tool(
+    "slack_mention_check",
+    "나를 @멘션한 메시지가 있는지 확인합니다. 멤버ID, 역할명, 또는 페르소나 이름으로 조회 가능. 확인 후 큐는 비워집니다.",
+    {
+      identity: z.string().describe("확인할 대상: 멤버ID (impl-A), 역할명 (implementer), 또는 페르소나이름 (Forge)"),
+      peek: z.boolean().default(false).describe("true 시 큐를 비우지 않고 확인만"),
+    },
+    async ({ identity, peek }) => {
+      const name = identity.replace(/^@/, "").trim();
+      const nameLower = name.toLowerCase();
+
+      // Try multiple keys: exact name, role from persona lookup, persona name
+      const keysToCheck: string[] = [name];
+      const roleFromPersona = PERSONA_NAME_TO_ROLE[nameLower];
+      if (roleFromPersona) keysToCheck.push(roleFromPersona);
+      // Also check if it's already a role
+      if (AGENT_PERSONAS[name]) keysToCheck.push(name);
+      if (AGENT_PERSONAS[nameLower]) keysToCheck.push(nameLower);
+
+      const allMentions: unknown[] = [];
+      const foundKeys: string[] = [];
+
+      for (const key of [...new Set(keysToCheck)]) {
+        const dbKey = `mention_queue:${key}`;
+        const row = db.prepare(`SELECT value FROM kv_store WHERE key = ?`).get(dbKey) as { value: string } | undefined;
+        if (row) {
+          try {
+            const parsed = JSON.parse(row.value);
+            if (Array.isArray(parsed) && parsed.length > 0) {
+              allMentions.push(...parsed);
+              foundKeys.push(dbKey);
+            }
+          } catch { /* ignore parse errors */ }
+        }
+      }
+
+      // Clear queues unless peek mode
+      if (!peek && foundKeys.length > 0) {
+        for (const key of foundKeys) {
+          db.prepare(`DELETE FROM kv_store WHERE key = ?`).run(key);
+        }
+      }
+
+      if (allMentions.length === 0) {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({ ok: true, mentions: [], count: 0, message: "새로운 멘션 없음" }, null, 2),
+          }],
+        };
+      }
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            ok: true,
+            count: allMentions.length,
+            mentions: allMentions,
+            cleared: !peek,
+            hint: "멘션에 답장하려면 slack_team_send의 mention에 상대 이름을 넣어 응답하세요.",
           }, null, 2),
         }],
       };
@@ -620,13 +827,22 @@ export function registerTeamTools(server: McpServer): void {
       update_member_status: z.enum(["active", "idle", "done"]).optional().describe("멤버 상태도 함께 업데이트"),
     },
     async ({ team_id, sender, summary, details, status, update_member_status }) => {
-      const team = getTeam(team_id);
-      const member = team.members.get(sender);
-      if (!member) {
-        throw new Error(`멤버 '${sender}'가 팀 '${team_id}'에 등록되어 있지 않습니다.`);
+      let team: ReturnType<typeof getTeam> | null = null;
+      let member: TeamMember | undefined;
+      let teamChannelId: string;
+
+      try {
+        team = getTeam(team_id);
+        member = team.members.get(sender);
+        teamChannelId = team.channelId;
+      } catch {
+        const ctx = db.prepare(`SELECT context_snapshot FROM agent_context WHERE agent_id = ? AND team_id = ?`).get(sender, team_id) as { context_snapshot: string } | undefined;
+        const storedChannelId = ctx ? JSON.parse(ctx.context_snapshot)?.channelId : undefined;
+        teamChannelId = storedChannelId || SLACK_DEFAULT_CHANNEL;
+        console.error(`[team_report] Team '${team_id}' not in memory, fallback to channel ${teamChannelId}`);
       }
 
-      if (update_member_status) {
+      if (member && update_member_status) {
         member.status = update_member_status;
         saveTeamsToState();
       }
@@ -638,8 +854,8 @@ export function registerTeamTools(server: McpServer): void {
         progress: "진행중", blocked: "차단됨", review: "검토 필요", done: "완료",
       };
 
-      const icon = getRoleIcon(member.role);
-      const trackStr = member.track ? ` [${member.track}]` : "";
+      const icon = member ? getRoleIcon(member.role) : "🤖";
+      const trackStr = member?.track ? ` [${member.track}]` : "";
       const emoji = statusEmoji[status] || "📋";
       const label = statusLabel[status] || status;
 
@@ -649,15 +865,17 @@ export function registerTeamTools(server: McpServer): void {
       const mainMsg = await slack.chat.postMessage({
         channel: mainCh,
         text: [
-          `${emoji} *[${team.id}]* ${icon} *${sender}*${trackStr} — ${label}`,
+          `${emoji} *[${team_id}]* ${icon} *${sender}*${trackStr} — ${label}`,
           summary,
         ].join("\n"),
         mrkdwn: true,
       });
 
-      const identity = agentIdentity(sender, member);
+      const identity = member
+        ? agentIdentity(sender, member)
+        : { username: sender, icon_emoji: ":robot_face:" };
       const teamMsg = await slack.chat.postMessage({
-        channel: team.channelId,
+        channel: teamChannelId,
         text: `${emoji} *${label}*\n${summary}`,
         mrkdwn: true,
         username: identity.username,
@@ -665,7 +883,7 @@ export function registerTeamTools(server: McpServer): void {
       });
 
       if (details) {
-        await sendSmart(team.channelId, details, {
+        await sendSmart(teamChannelId, details, {
           thread_ts: teamMsg.ts,
           title: `${sender} 상세 보고`,
           filename: `report-${sender}-${Date.now()}.txt`,

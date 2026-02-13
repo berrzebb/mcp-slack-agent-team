@@ -234,7 +234,9 @@ export const ROLE_ICONS: Record<string, string> = {
   "test-writer": "🧪",
   validator: "✅",
   "code-reviewer": "🔍",
+  "ux-reviewer": "🎨",
   debugger: "🐛",
+  "db-specialist": "🗄️",
   refactorer: "♻️",
   researcher: "🔬",
 };
@@ -247,7 +249,42 @@ export const ROLE_SLACK_EMOJI: Record<string, string> = {
   "test-writer": ":test_tube:",
   validator: ":white_check_mark:",
   "code-reviewer": ":mag:",
+  "ux-reviewer": ":art:",
   debugger: ":bug:",
+  "db-specialist": ":file_cabinet:",
   refactorer: ":recycle:",
   researcher: ":microscope:",
 };
+
+/**
+ * Agent persona mapping — gives each agent role a unique display name
+ * and personality for Slack. Used by agentIdentity() in state.ts.
+ */
+export interface AgentPersona {
+  displayName: string;   // Slack username
+  emoji: string;         // Slack icon_emoji
+  title: string;         // Korean title for messages
+}
+
+export const AGENT_PERSONAS: Record<string, AgentPersona> = {
+  lead:            { displayName: "Aria",    emoji: ":crown:",              title: "팀 리드" },
+  planner:         { displayName: "Sage",    emoji: ":clipboard:",          title: "설계 분석가" },
+  "sub-leader":    { displayName: "Nova",    emoji: ":dart:",               title: "트랙 서브리더" },
+  implementer:     { displayName: "Forge",   emoji: ":hammer:",             title: "풀스택 엔지니어" },
+  "db-specialist": { displayName: "Quinn",   emoji: ":file_cabinet:",       title: "DB 전문가" },
+  "code-reviewer": { displayName: "Lens",    emoji: ":mag:",                title: "코드 리뷰어" },
+  "ux-reviewer":   { displayName: "Pixel",   emoji: ":art:",                title: "UX 리뷰어" },
+  debugger:        { displayName: "Trace",   emoji: ":bug:",                title: "디버거" },
+  "test-writer":   { displayName: "Spec",    emoji: ":test_tube:",          title: "테스트 작성자" },
+  refactorer:      { displayName: "Prism",   emoji: ":recycle:",            title: "리팩토러" },
+  validator:       { displayName: "Gate",    emoji: ":white_check_mark:",   title: "검증자" },
+  researcher:      { displayName: "Scout",   emoji: ":microscope:",         title: "리서처" },
+};
+
+/**
+ * Reverse lookup: persona displayName (case-insensitive) → role key.
+ * Used by @mention routing to resolve "@Sage" → "planner", etc.
+ */
+export const PERSONA_NAME_TO_ROLE: Record<string, string> = Object.fromEntries(
+  Object.entries(AGENT_PERSONAS).map(([role, p]) => [p.displayName.toLowerCase(), role]),
+);

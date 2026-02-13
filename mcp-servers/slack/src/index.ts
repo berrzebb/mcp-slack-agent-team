@@ -11,8 +11,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
 import { resolveBotUserId, getBotUserId } from "./slack-client.js";
-import { restoreTeamsFromState } from "./state.js";
-import { startBackgroundPoller } from "./background-poller.js";
+import { restoreTeamsFromState, saveTeamsToState, saveState } from "./state.js";
+import { startBackgroundPoller, stopBackgroundPoller } from "./background-poller.js";
 
 // Tool registrations
 import { registerBasicTools } from "./tools/basic.js";
@@ -23,6 +23,7 @@ import { registerApprovalTools } from "./tools/approval.js";
 import { registerFileTools } from "./tools/file.js";
 import { registerStateTools } from "./tools/state.js";
 import { registerContextTools } from "./tools/context.js";
+import { registerDashboardTools } from "./tools/dashboard.js";
 
 // ── Server ─────────────────────────────────────────────────────
 
@@ -43,6 +44,7 @@ registerApprovalTools(server);
 registerFileTools(server);
 registerStateTools(server);
 registerContextTools(server);
+registerDashboardTools(server);
 
 // ── Start ──────────────────────────────────────────────────────
 
@@ -61,6 +63,44 @@ async function main() {
 
   // Start background message collector (runs independently of tool calls)
   startBackgroundPoller();
+
+  // ── Graceful Shutdown ────────────────────────────────────────
+  const shutdown = async (signal: string) => {
+    console.error(`\n⚡ ${signal} received — graceful shutdown...`);
+
+    // Stop background poller
+    stopBackgroundPoller();
+
+    // Save team state
+    try {
+      saveTeamsToState();
+      saveState({ updated_at: new Date().toISOString() } as any);
+      console.error("💾 State saved successfully");
+    } catch (err) {
+      console.error("⚠️ State save failed:", err);
+    }
+
+    // Send shutdown notification to Slack (best effort)
+    try {
+      const { SLACK_DEFAULT_CHANNEL } = await import("./types.js");
+      if (SLACK_DEFAULT_CHANNEL) {
+        const { slack } = await import("./slack-client.js");
+        await slack.chat.postMessage({
+          channel: SLACK_DEFAULT_CHANNEL,
+          text: `🔄 *MCP 서버 재시작 중* (${signal})... 잠시 후 복귀합니다.`,
+          mrkdwn: true,
+        });
+      }
+    } catch {
+      // Best effort — don't block shutdown
+    }
+
+    console.error("👋 Shutdown complete");
+    process.exit(0);
+  };
+
+  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
 }
 
 main().catch((err) => {

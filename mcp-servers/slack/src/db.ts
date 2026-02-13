@@ -112,6 +112,45 @@ db.exec(`
     PRIMARY KEY (channel_id, thread_ts)
   );
   CREATE INDEX IF NOT EXISTS idx_watched_created ON watched_threads(created_at);
+
+  -- Agent heartbeat tracking
+  CREATE TABLE IF NOT EXISTS agent_heartbeats (
+    agent_id    TEXT PRIMARY KEY,
+    team_id     TEXT,
+    status      TEXT NOT NULL DEFAULT 'alive',
+    last_seen   TEXT NOT NULL DEFAULT (datetime('now')),
+    metadata    TEXT
+  );
+
+  -- Scheduled messages
+  CREATE TABLE IF NOT EXISTS scheduled_messages (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id    TEXT    NOT NULL,
+    message       TEXT    NOT NULL,
+    scheduled_at  TEXT    NOT NULL,
+    thread_ts     TEXT,
+    status        TEXT    NOT NULL DEFAULT 'pending',
+    slack_scheduled_id TEXT,
+    created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+    created_by    TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_sched_status ON scheduled_messages(status, scheduled_at);
+
+  -- Permission requests (leader auto-approval)
+  CREATE TABLE IF NOT EXISTS permission_requests (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    team_id       TEXT    NOT NULL,
+    requester_id  TEXT    NOT NULL,
+    action        TEXT    NOT NULL,
+    reason        TEXT    NOT NULL DEFAULT '',
+    status        TEXT    NOT NULL DEFAULT 'pending',
+    decided_by    TEXT,
+    decision_ts   TEXT,
+    message_ts    TEXT,
+    channel_id    TEXT,
+    created_at    TEXT    NOT NULL DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_perm_status ON permission_requests(team_id, status);
 `);
 
 // ── Prepared Statements ────────────────────────────────────────
@@ -264,10 +303,58 @@ export function inboxUnreadCount(channelId: string): number {
   return row.cnt;
 }
 
+// ── FTS5 Full-Text Search on inbox ─────────────────────────────
+
+try {
+  db.exec(`
+    CREATE VIRTUAL TABLE IF NOT EXISTS inbox_fts USING fts5(
+      text, user_id, channel_id,
+      content='inbox',
+      content_rowid='id'
+    );
+  `);
+  // Triggers to keep FTS in sync
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS inbox_ai AFTER INSERT ON inbox BEGIN
+      INSERT INTO inbox_fts(rowid, text, user_id, channel_id)
+      VALUES (new.id, new.text, new.user_id, new.channel_id);
+    END;
+  `);
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS inbox_ad AFTER DELETE ON inbox BEGIN
+      INSERT INTO inbox_fts(inbox_fts, rowid, text, user_id, channel_id)
+      VALUES ('delete', old.id, old.text, old.user_id, old.channel_id);
+    END;
+  `);
+} catch {
+  // FTS5 extension not available — search will fall back to LIKE
+  console.error("[db] FTS5 not available, full-text search will use LIKE fallback");
+}
+
 // 오래된 데이터 정리 (7일 이상 read/processed)
 stmts.inboxPurgeOld.run();
 // 오래된 watched threads 정리 (48시간 이상)
 stmts.watchClean.run();
+
+// ── Auto-Purge Interval (every 6 hours) ────────────────────────
+
+const AUTO_PURGE_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+const purgeHandle = setInterval(() => {
+  try {
+    const purged = stmts.inboxPurgeOld.run();
+    stmts.watchClean.run();
+    if (purged.changes > 0) {
+      console.error(`[db] Auto-purge: removed ${purged.changes} old inbox entries`);
+    }
+  } catch (err) {
+    console.error("[db] Auto-purge error:", err);
+  }
+}, AUTO_PURGE_INTERVAL_MS);
+
+if (purgeHandle && typeof purgeHandle === "object" && "unref" in purgeHandle) {
+  purgeHandle.unref();
+}
 
 // ── Channel Cursor Helpers ─────────────────────────────────────
 
@@ -430,6 +517,154 @@ export function getDecisionsByType(teamId: string, type: string): TeamDecision[]
 /** 최근 N개 의사결정 */
 export function getRecentDecisions(teamId: string, limit: number = 10): TeamDecision[] {
   return stmts.decisionRecent.all(teamId, limit) as TeamDecision[];
+}
+
+// ── Heartbeat Helpers ──────────────────────────────────────────
+
+export function updateHeartbeat(agentId: string, teamId?: string, metadata?: Record<string, unknown>): void {
+  db.prepare(`
+    INSERT INTO agent_heartbeats (agent_id, team_id, status, last_seen, metadata)
+    VALUES (?, ?, 'alive', datetime('now'), ?)
+    ON CONFLICT(agent_id) DO UPDATE SET
+      team_id = COALESCE(excluded.team_id, team_id),
+      status = 'alive',
+      last_seen = datetime('now'),
+      metadata = COALESCE(excluded.metadata, metadata)
+  `).run(agentId, teamId || null, metadata ? JSON.stringify(metadata) : null);
+}
+
+export function getHeartbeats(): Array<{
+  agent_id: string; team_id: string | null;
+  status: string; last_seen: string; metadata: string | null;
+}> {
+  return db.prepare(`SELECT * FROM agent_heartbeats ORDER BY last_seen DESC`).all() as Array<{
+    agent_id: string; team_id: string | null;
+    status: string; last_seen: string; metadata: string | null;
+  }>;
+}
+
+export function getStaleAgents(thresholdMinutes: number = 5): Array<{
+  agent_id: string; team_id: string | null;
+  last_seen: string;
+}> {
+  return db.prepare(`
+    SELECT agent_id, team_id, last_seen FROM agent_heartbeats
+    WHERE last_seen < datetime('now', '-' || ? || ' minutes')
+    AND status = 'alive'
+  `).all(thresholdMinutes) as Array<{
+    agent_id: string; team_id: string | null;
+    last_seen: string;
+  }>;
+}
+
+export function markAgentStale(agentId: string): void {
+  db.prepare(`UPDATE agent_heartbeats SET status = 'stale' WHERE agent_id = ?`).run(agentId);
+}
+
+// ── Inbox Search Helpers ───────────────────────────────────────
+
+export function searchInbox(query: string, limit: number = 20): InboxRow[] {
+  // Try FTS5 first, fallback to LIKE
+  try {
+    const rows = db.prepare(`
+      SELECT inbox.* FROM inbox_fts
+      JOIN inbox ON inbox.id = inbox_fts.rowid
+      WHERE inbox_fts MATCH ?
+      ORDER BY inbox.message_ts DESC
+      LIMIT ?
+    `).all(query, limit) as InboxRow[];
+    return rows;
+  } catch {
+    // FTS5 not available — LIKE fallback
+    return db.prepare(`
+      SELECT * FROM inbox
+      WHERE text LIKE ?
+      ORDER BY message_ts DESC
+      LIMIT ?
+    `).all(`%${query}%`, limit) as InboxRow[];
+  }
+}
+
+// ── Scheduled Message Helpers ──────────────────────────────────
+
+export function addScheduledMessage(channelId: string, message: string, scheduledAt: string, threadTs?: string, createdBy?: string): number {
+  const result = db.prepare(`
+    INSERT INTO scheduled_messages (channel_id, message, scheduled_at, thread_ts, created_by)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(channelId, message, scheduledAt, threadTs || null, createdBy || null);
+  return result.lastInsertRowid as number;
+}
+
+export function getPendingScheduledMessages(): Array<{
+  id: number; channel_id: string; message: string;
+  scheduled_at: string; thread_ts: string | null; status: string;
+}> {
+  return db.prepare(`
+    SELECT * FROM scheduled_messages
+    WHERE status = 'pending' AND scheduled_at <= datetime('now')
+    ORDER BY scheduled_at ASC
+  `).all() as Array<{
+    id: number; channel_id: string; message: string;
+    scheduled_at: string; thread_ts: string | null; status: string;
+  }>;
+}
+
+export function markScheduledSent(id: number, slackId?: string): void {
+  db.prepare(`
+    UPDATE scheduled_messages SET status = 'sent', slack_scheduled_id = ?
+    WHERE id = ?
+  `).run(slackId || null, id);
+}
+
+export function getScheduledMessages(channelId?: string): Array<{
+  id: number; channel_id: string; message: string;
+  scheduled_at: string; status: string; created_by: string | null;
+}> {
+  if (channelId) {
+    return db.prepare(`
+      SELECT * FROM scheduled_messages WHERE channel_id = ? ORDER BY scheduled_at ASC
+    `).all(channelId) as Array<{
+      id: number; channel_id: string; message: string;
+      scheduled_at: string; status: string; created_by: string | null;
+    }>;
+  }
+  return db.prepare(`SELECT * FROM scheduled_messages ORDER BY scheduled_at ASC`).all() as Array<{
+    id: number; channel_id: string; message: string;
+    scheduled_at: string; status: string; created_by: string | null;
+  }>;
+}
+
+// ── Permission Request Helpers ─────────────────────────────────
+
+export function createPermissionRequest(teamId: string, requesterId: string, action: string, reason: string, messageTs: string, channelId: string): number {
+  const result = db.prepare(`
+    INSERT INTO permission_requests (team_id, requester_id, action, reason, message_ts, channel_id)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(teamId, requesterId, action, reason, messageTs, channelId);
+  return result.lastInsertRowid as number;
+}
+
+export function resolvePermissionRequest(id: number, status: "approved" | "denied", decidedBy: string): void {
+  db.prepare(`
+    UPDATE permission_requests SET status = ?, decided_by = ?, decision_ts = datetime('now')
+    WHERE id = ?
+  `).run(status, decidedBy, id);
+}
+
+export function getPendingPermissions(teamId: string): Array<{
+  id: number; requester_id: string; action: string;
+  reason: string; message_ts: string; channel_id: string;
+  created_at: string;
+}> {
+  return db.prepare(`
+    SELECT * FROM permission_requests
+    WHERE team_id = ? AND status = 'pending'
+    ORDER BY created_at ASC
+  `).all(teamId) as Array<{
+    id: number; requester_id: string; action: string;
+    reason: string; message_ts: string; channel_id: string;
+    created_at: string;
+  }>;
 }
 
 console.error(`📦 SQLite DB initialized: ${DB_FILE}`);

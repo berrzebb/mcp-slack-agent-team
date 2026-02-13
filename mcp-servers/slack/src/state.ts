@@ -4,7 +4,7 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { dirname } from "path";
-import { STATE_FILE, SLACK_DEFAULT_CHANNEL, ROLE_ICONS, ROLE_SLACK_EMOJI } from "./types.js";
+import { STATE_FILE, SLACK_DEFAULT_CHANNEL, ROLE_ICONS, ROLE_SLACK_EMOJI, AGENT_PERSONAS } from "./types.js";
 import type { LoopState, PersistentState, Team, TeamMember } from "./types.js";
 
 // ── In-Memory Team Store ───────────────────────────────────────
@@ -76,6 +76,10 @@ export function restoreTeamsFromState(): void {
 // ── Team Helpers ───────────────────────────────────────────────
 
 export function getTeam(teamId: string): Team {
+  // Lazy restore: if teams Map is empty, try reloading from state.json
+  if (teams.size === 0) {
+    restoreTeamsFromState();
+  }
   const team = teams.get(teamId);
   if (!team) throw new Error(`팀 '${teamId}'를 찾을 수 없습니다. 등록된 팀: ${[...teams.keys()].join(", ") || "(없음)"}`);
   return team;
@@ -99,10 +103,31 @@ export function getRoleSlackEmoji(role: string): string {
 
 /**
  * Returns { username, icon_emoji } for chat.postMessage
- * so each agent appears as a distinct Slack "user".
+ * so each agent appears as a distinct Slack "user" with a persona name.
  * Requires chat:write.customize bot scope.
+ *
+ * Persona lookup order:
+ *   1. AGENT_PERSONAS[member.role]       (exact role match)
+ *   2. AGENT_PERSONAS[member.agentType]  (agent_type fallback)
+ *   3. AGENT_PERSONAS[senderId]          (id fallback)
+ *   4. Generic fallback
  */
 export function agentIdentity(senderId: string, member: TeamMember): { username: string; icon_emoji: string } {
+  const persona =
+    AGENT_PERSONAS[member.role] ||
+    AGENT_PERSONAS[member.agentType] ||
+    AGENT_PERSONAS[senderId] ||
+    null;
+
+  if (persona) {
+    const trackSuffix = member.track ? ` [${member.track}]` : "";
+    return {
+      username: `${persona.displayName}${trackSuffix}`,
+      icon_emoji: persona.emoji,
+    };
+  }
+
+  // Fallback for unknown roles
   const trackSuffix = member.track ? `-${member.track}` : "";
   const username = `${senderId}${trackSuffix}`.replace(/[^a-zA-Z0-9._-]/g, "-");
   return {

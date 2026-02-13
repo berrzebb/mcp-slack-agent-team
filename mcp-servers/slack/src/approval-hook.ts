@@ -1,23 +1,25 @@
 #!/usr/bin/env node
 
 /**
- * Slack Approval Hook for Claude Code
+ * Slack Approval Hook for Claude Code — ALL tool types
  *
- * PreToolUse hook - intercepts dangerous commands,
- * sends approval request to Slack, polls for user response.
+ * Works as both PreToolUse AND PermissionRequest hook.
+ * Handles ALL tool permission requests, not just Bash.
  *
- * Two approval methods (checked in parallel):
- *   1. Emoji reaction on the message:
- *      - white_check_mark / +1 / thumbsup -> approve
- *      - x / -1 / thumbsdown -> deny
- *   2. Thread reply (fallback):
- *      - "y", "yes", "ok", "approve" -> approve
- *      - "n", "no", "deny", "reject" -> deny
+ * PreToolUse (Bash only, via settings.json matcher):
+ *   - Intercepts ALL non-safe Bash commands
+ *   - On approve: outputs permissionDecision="allow" (bypasses permission system)
+ *   - On deny: outputs permissionDecision="deny" (blocks tool call)
  *
- * Timeout: auto-deny after APPROVAL_TIMEOUT seconds -> exit 2
+ * PermissionRequest (ALL tools, no matcher restriction):
+ *   - Fires when ANY permission dialog is about to show
+ *   - Sends approval to Slack, returns decision.behavior="allow"/"deny"
  *
- * Receives tool use info as JSON on stdin from Claude Code.
- * Requires scopes: chat:write, reactions:write, reactions:read, channels:history
+ * Approval methods (checked in parallel):
+ *   1. Emoji reaction: :white_check_mark: approve / :x: deny
+ *   2. Thread reply: "y", "yes", "ok" / "n", "no", "deny"
+ *
+ * Timeout: auto-deny after APPROVAL_TIMEOUT seconds
  */
 
 import { WebClient } from "@slack/web-api";
@@ -38,7 +40,7 @@ const CH: string = SLACK_DEFAULT_CHANNEL;
 
 let BOT_USER_ID = "";
 
-// -- Dangerous command patterns --
+// -- Dangerous command patterns (shown with :rotating_light: indicator) --
 
 const DANGEROUS_PATTERNS = [
   /^git\s+push/,
@@ -54,6 +56,35 @@ const DANGEROUS_PATTERNS = [
   /^taskkill\s+/,
 ];
 
+// -- Commands that are always safe (skip Slack approval entirely) --
+// These match the allow-list in settings.json — no need to ask
+const SAFE_PATTERNS = [
+  /^cargo\s+/,
+  /^npm\s+/,
+  /^npx\s+/,
+  /^git\s+status/,
+  /^git\s+diff/,
+  /^git\s+log/,
+  /^git\s+branch/,
+  /^git\s+stash/,
+  /^git\s+add/,
+  /^git\s+commit/,
+  /^echo\s+/,
+  /^cat\s+/,
+  /^head\s+/,
+  /^tail\s+/,
+  /^ls\s+/,
+  /^dir\s+/,
+  /^cd\s+/,
+  /^curl\s+/,
+  /^grep\s+/,
+  /^find\s+/,
+  /^wc\s+/,
+  /^sort\s+/,
+  /^tree\s+/,
+  /^mkdir\s+/,
+];
+
 const APPROVE_REACTIONS = ["white_check_mark", "+1", "thumbsup", "heavy_check_mark"];
 const DENY_REACTIONS = ["x", "-1", "thumbsdown", "no_entry_sign", "octagonal_sign"];
 const APPROVE_WORDS = ["y", "yes", "ok", "approve", "ㅇ", "ㅇㅇ", "허용", "승인"];
@@ -61,50 +92,102 @@ const DENY_WORDS = ["n", "no", "deny", "reject", "ㄴ", "ㄴㄴ", "거부", "거
 
 // -- Main --
 
+/** Output JSON decision for PreToolUse hook and exit */
+function outputPreToolUseDecision(
+  decision: "allow" | "deny" | "ask",
+  reason: string,
+): never {
+  const json = JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: decision,
+      permissionDecisionReason: reason,
+    },
+  });
+  process.stdout.write(json);
+  process.exit(0);
+}
+
+/** Output JSON decision for PermissionRequest hook and exit */
+function outputPermissionRequestDecision(
+  behavior: "allow" | "deny",
+  message?: string,
+): never {
+  const json = JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName: "PermissionRequest",
+      decision: {
+        behavior,
+        ...(behavior === "deny" && message ? { message } : {}),
+      },
+    },
+  });
+  process.stdout.write(json);
+  process.exit(0);
+}
+
 async function main() {
   let input = "";
   for await (const chunk of process.stdin) {
     input += chunk;
   }
 
-  let toolInfo: { tool_name?: string; tool_input?: { command?: string } };
+  let toolInfo: {
+    hook_event_name?: string;
+    tool_name?: string;
+    tool_input?: Record<string, unknown>;
+  };
   try {
     toolInfo = JSON.parse(input);
   } catch {
     process.exit(0);
   }
 
+  const hookEvent = toolInfo.hook_event_name || "PreToolUse";
   const toolName = toolInfo.tool_name || "";
-  const command = toolInfo.tool_input?.command || "";
+  const toolInput = toolInfo.tool_input || {};
+  const isBash = toolName === "Bash" || toolName === "bash";
+  const command = isBash ? String(toolInput.command || "") : "";
 
-  if (toolName !== "Bash" && toolName !== "bash") {
-    process.exit(0);
+  // -- Bash-specific: safe command bypass --
+  if (isBash) {
+    const isSafe = SAFE_PATTERNS.some((p) => p.test(command));
+    if (isSafe) {
+      if (hookEvent === "PermissionRequest") {
+        outputPermissionRequestDecision("allow");
+      }
+      process.exit(0);
+    }
   }
 
-  const isDangerous = DANGEROUS_PATTERNS.some((p) => p.test(command));
-  if (!isDangerous) {
-    process.exit(0);
-  }
+  const isDangerous = isBash && DANGEROUS_PATTERNS.some((p) => p.test(command));
 
   // Resolve bot user ID
   try {
     const auth = await slack.auth.test();
     BOT_USER_ID = auth.user_id || "";
   } catch {
-    // proceed anyway
+    // Can't reach Slack — fall back to normal permission dialog
+    process.exit(0);
   }
 
-  // -- Send approval request --
+  // -- Build approval message --
 
-  const truncatedCmd = command.length > 500 ? command.slice(0, 500) + "..." : command;
+  const severity = isDangerous
+    ? ":rotating_light: *DANGEROUS*"
+    : ":warning: *Approval Required*";
+
+  const detail = isBash
+    ? "```" + (command.length > 500 ? command.slice(0, 500) + "..." : command) + "```"
+    : formatToolInput(toolName, toolInput);
 
   try {
     const msg = await slack.chat.postMessage({
       channel: CH,
       text: [
-        ":warning: *Approval Required*",
+        severity + (isBash ? "" : " — `" + toolName + "`"),
         "",
-        "```" + truncatedCmd + "```",
+        detail,
         "",
         ":white_check_mark: react to approve  |  :x: react to deny",
         "(or reply *y* / *n* in thread)",
@@ -115,8 +198,6 @@ async function main() {
     });
 
     const ts = msg.ts!;
-
-    // Add waiting indicator
     await slack.reactions.add({ channel: CH, name: "hourglass_flowing_sand", timestamp: ts });
 
     // -- Poll for reaction OR thread reply --
@@ -126,35 +207,31 @@ async function main() {
     while (Date.now() < deadline) {
       await sleep(POLL_INTERVAL);
 
-      // Check reactions
       const decision = await checkReactions(ts);
-      if (decision === "approve") {
-        await respond(ts, ":white_check_mark: Approved (reaction)");
-        process.exit(0);
-      }
-      if (decision === "deny") {
-        await respond(ts, ":x: Denied (reaction)");
-        process.exit(2);
+      if (decision) {
+        const approved = decision === "approve";
+        await respond(ts, approved ? ":white_check_mark: Approved (reaction)" : ":x: Denied (reaction)");
+        outputDecision(hookEvent, approved, `${approved ? "Approved" : "Denied"} via Slack reaction`);
       }
 
-      // Check thread replies
       const replyDecision = await checkThreadReplies(ts);
-      if (replyDecision === "approve") {
-        await respond(ts, ":white_check_mark: Approved (reply)");
-        process.exit(0);
-      }
-      if (replyDecision === "deny") {
-        await respond(ts, ":x: Denied (reply)");
-        process.exit(2);
+      if (replyDecision) {
+        const approved = replyDecision === "approve";
+        await respond(ts, approved ? ":white_check_mark: Approved (reply)" : ":x: Denied (reply)");
+        outputDecision(hookEvent, approved, `${approved ? "Approved" : "Denied"} via Slack reply`);
       }
     }
 
     // Timeout
     await respond(ts, ":alarm_clock: Timeout (" + APPROVAL_TIMEOUT + "s) - auto denied");
-    process.exit(2);
+    outputDecision(hookEvent, false, "Approval timeout — auto denied after " + APPROVAL_TIMEOUT + "s");
   } catch (err) {
     console.error("Slack approval error:", err);
-    process.exit(2);
+    // On error, fall through to normal permission system
+    if (hookEvent === "PermissionRequest") {
+      process.exit(0);
+    }
+    outputPreToolUseDecision("ask", "Slack approval failed — please approve manually");
   }
 }
 
@@ -202,6 +279,47 @@ async function respond(threadTs: string, text: string): Promise<void> {
   } catch {
     // best effort
   }
+}
+
+// -- Helpers --
+
+/** Unified decision output — routes to correct JSON format based on hook event */
+function outputDecision(hookEvent: string, approved: boolean, reason: string): never {
+  if (hookEvent === "PermissionRequest") {
+    outputPermissionRequestDecision(approved ? "allow" : "deny", approved ? undefined : reason);
+  }
+  outputPreToolUseDecision(approved ? "allow" : "deny", reason);
+}
+
+/** Format non-Bash tool input into a readable Slack message */
+function formatToolInput(toolName: string, input: Record<string, unknown>): string {
+  const lines: string[] = [];
+
+  // Well-known tool fields
+  if (input.file_path) lines.push(`*File:* \`${input.file_path}\``);
+  if (input.url) lines.push(`*URL:* ${input.url}`);
+  if (input.query) lines.push(`*Query:* ${input.query}`);
+  if (input.pattern) lines.push(`*Pattern:* \`${input.pattern}\``);
+  if (input.prompt) lines.push(`*Prompt:* ${String(input.prompt).slice(0, 200)}...`);
+  if (input.description) lines.push(`*Desc:* ${input.description}`);
+
+  // For content/old_string/new_string show truncated preview
+  if (input.content) {
+    const c = String(input.content);
+    lines.push("*Content:*\n```" + (c.length > 300 ? c.slice(0, 300) + "..." : c) + "```");
+  }
+  if (input.old_string) {
+    const o = String(input.old_string);
+    lines.push("*Replace:*\n```" + (o.length > 200 ? o.slice(0, 200) + "..." : o) + "```");
+  }
+
+  // Fallback: dump keys if nothing matched above
+  if (lines.length === 0) {
+    const summary = JSON.stringify(input, null, 2);
+    lines.push("```" + (summary.length > 500 ? summary.slice(0, 500) + "..." : summary) + "```");
+  }
+
+  return lines.join("\n");
 }
 
 function sleep(ms: number): Promise<void> {

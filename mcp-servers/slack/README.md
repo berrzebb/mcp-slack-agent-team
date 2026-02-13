@@ -10,12 +10,19 @@ Slack을 통해 Claude Code 에이전트를 원격으로 제어하고, 멀티 �
 - **명령 루프**: `slack_command_loop`로 채팅 인터페이스를 완전히 대체
 - **백그라운드 폴러**: 10초 간격 자동 메시지 수집 — 도구 호출 없이도 메시지 유실 방지
 - **긴 메시지 자동 처리**: 3,900자 초과 시 자동 분할, 8,000자 초과 시 파일 업로드
-- **에이전트 팀 관리**: 전용 채널 생성, 역할별 이름/아이콘 표시, 브로드캠스트
-- **영구 컨텍스트 관리**: SQLite 기반 태스크/의사결정/에이전트 컨텍스트 저장 — 컨텍스트 압축 후 즉시 복구
+- **에이전트 팀 관리**: 전용 채널 생성, 역할별 이름/아이콘 표시, 브로드캠스트- **에이전트 페르소나**: 12종 named persona (Aria👑, Sage📋, Forge🔨 등) — 역할별 고유 이름·이모지 자동 표시
+- **@멘션 시스템**: 페르소나 이름·역할·멤버 ID로 @멘션 → 멘션 큐 저장 → `slack_mention_check`로 수신 확인
+- **리액션-커맨드**: Slack 이모지 리액션(✅❌🚀🔄🗑️❓)을 커맨드로 자동 변환- **영구 컨텍스트 관리**: SQLite 기반 태스크/의사결정/에이전트 컨텍스트 저장 — 컨텍스트 압축 후 즉시 복구
 - **핫 리로드**: `slack_reload`로 TypeScript 빌드 + 서버 재시작 — wrapper.js로 Claude Code 연결 유지
-- **승인 훅**: 위험 명령(git push, rm 등) 실행 전 Slack에서 승인 요청
+- **승인 훅**: 위험 명령(git push, rm 등) + MCP 도구 + 권한 요청 모두 Slack 승인 지원, 안전 명령 자동 바이패스
 - **파일 전송**: Slack 파일 다운로드/업로드 (이미지, 문서, 로그 등)
-- **세션 복구**: compact/재시작 후 상태를 자동 복원
+- **하트비트**: 에이전트 생존 감시 — 무응답 에이전트 자동 감지 + 리더 알림
+- **대시보드**: 팀 진행률·에이전트 상태·Rate Limiter 메트릭을 카드 형태 대시보드로 표시
+- **Rate Limiter**: Slack API 중앙집중 토큰 버킷 + 429 자동 백오프 + 메트릭 수집
+- **DM + 예약 메시지**: 개인 DM, 예약 전송, 메시지 고정
+- **인박스 검색**: FTS5 전문검색으로 맞춤형 메시지 검색
+- **팀 권한 요청**: 팀원→리더 권한 요청/승인 워크플로우 (Slack 리액션/텍스트 응답)
+- **그레이스풀 셧다운**: SIGINT/SIGTERM 시 상태 자동 저장 + Slack 재시작 알림
 
 ## 프로젝트 구조
 
@@ -24,21 +31,23 @@ src/
 ├── index.ts               # 엔트리포인트 (도구 등록 + 서버 시작)
 ├── wrapper.ts             # 자동 재시작 래퍼 (exit 42 → 핫 리로드)
 ├── background-poller.ts   # 백그라운드 메시지 수집기 (10초 간격)
-├── types.ts               # 인터페이스, 상수, 타입 정의
+├── types.ts               # 인터페이스, 상수, 타입 정의 + 에이전트 페르소나
 ├── db.ts                  # SQLite 초기화 + 데이터 접근 헬퍼
 ├── state.ts               # JSON 상태 관리 + 팀 레지스트리
 ├── slack-client.ts        # WebClient + sendSmart + 메시지 분할
 ├── formatting.ts          # 메시지 포맷 + 리치 포맷팅 유틸리티
-├── approval-hook.ts       # 위험 명령 Slack 승인 훅
+├── rate-limiter.ts        # 중앙집중 Rate Limiter (토큰 버킷 + 자동 백오프)
+├── approval-hook.ts       # 범용 Slack 승인 훅 (Bash + 도구 + 권한)
 └── tools/
     ├── basic.ts           # 기본 통신 + 응답 + 진단 (10개 도구)
     ├── content.ts         # 코드/스니펫 업로드 (2개 도구)
-    ├── loop.ts            # 명령 루프 + 인박스 (3개 도구)
-    ├── team.ts            # 팀 관리 (10개 도구)
+    ├── loop.ts            # 명령 루프 + 인박스 + 리액션 커맨드 (3개 도구)
+    ├── team.ts            # 팀 관리 + 페르소나 멘션 (11개 도구)
     ├── context.ts         # 팀 컨텍스트 관리 (7개 도구)
     ├── approval.ts        # 승인 요청 (1개 도구)
     ├── file.ts            # 파일 다운로드/업로드 (2개 도구)
-    └── state.ts           # 상태 저장/복원 + 비용 보고 (3개 도구)
+    ├── state.ts           # 상태 저장/복원 + 비용 보고 (3개 도구)
+    └── dashboard.ts       # 대시보드 + 하트비트 + DM + 예약/검색/권한 (10개 도구)
 ```
 
 ## 워크플로우
@@ -157,7 +166,11 @@ npx tsx src/test.ts
 
 ### 5. (선택) 승인 훅 설정
 
-위험한 명령(`git push`, `rm`, `git reset` 등)을 실행하기 전에 Slack에서 사용자 승인을 요청하는 훅입니다.
+위험한 Bash 명령, MCP 도구, 권한 요청을 실행하기 전에 Slack에서 사용자 승인을 요청하는 훅입니다.
+
+**지원 훅 이벤트**: `PreToolUse` (Bash 명령 + MCP 도구), `PermissionRequest` (권한 요청)
+
+**안전 명령 자동 바이패스**: `cargo`, `npm`, `node`, `git status/diff/log/add/commit`, `echo`, `cat`, `head`, `tail`, `wc`, `find`, `ls` 등 ~30종 패턴은 Slack 승인 없이 자동 허용
 
 `.claude/settings.json`에 추가:
 
@@ -174,6 +187,17 @@ npx tsx src/test.ts
           }
         ]
       }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node path/to/slack-mcp-server/dist/approval-hook.js"
+          }
+        ]
+      }
     ]
   }
 }
@@ -181,9 +205,11 @@ npx tsx src/test.ts
 
 위험 명령 감지 시 Slack 채널에 승인 요청이 전송됩니다:
 
+- 🚨 **DANGEROUS** (데이터 삭제, 강제 푸시 등) / ⚠️ **Approval Required** (일반 위험 명령)
 - ✅ 리액션 또는 스레드에 `y` → **승인** (명령 실행)
 - ❌ 리액션 또는 스레드에 `n` → **거부** (명령 차단)
 - 타임아웃 (기본 120초) → **자동 거부**
+- 오류 발생 시 → 기본 권한 시스템으로 폴백 (하드 거부 대신)
 
 ## 필요한 Bot Token Scopes
 
@@ -203,6 +229,8 @@ Slack App → OAuth & Permissions → Bot Token Scopes:
 | `channels:join` | 채널 자동 참가 | 팀 관리 |
 | `users:read` | 사용자 정보 조회 | 봇 ID 자동 감지 |
 | `files:write` | 코드/로그 파일 업로드 | `slack_upload_snippet`, `slack_send_code`, 긴 메시지 자동 업로드 |
+| `pins:write` | 메시지 고정/해제 | `slack_pin_message` |
+| `im:write` | DM 채널 열기 + 전송 | `slack_send_dm` |
 
 > **최소 구성** (기본 통신만): `chat:write`, `channels:history`, `reactions:write`, `users:read`
 >
@@ -211,8 +239,10 @@ Slack App → OAuth & Permissions → Bot Token Scopes:
 > **팀 보고 + 승인 기능**: + `reactions:read` (승인 리액션 감지)
 >
 > **승인 훅 추가**: + `reactions:read`
+>
+> **대시보드/DM 추가**: + `pins:write`, `im:write`
 
-## 제공 도구 (38개)
+## 제공 도구 (49개)
 
 ### 기본 커뮤니케이션 + 응답 (10개)
 
@@ -244,20 +274,21 @@ Slack App → OAuth & Permissions → Bot Token Scopes:
 | `slack_check_inbox` | SQLite 인박스에서 미읽 메시지 확인 (fresh=true로 즉시 폴링 가능) |
 | `slack_wait_for_reply` | 스레드/채널에서 새 메시지 대기 |
 
-### 에이전트 팀 관리 (10개)
+### 에이전트 팀 관리 (11개)
 
 | 도구 | 설명 |
 |------|------|
-| `slack_team_create` | 팀 전용 채널 생성 + 초기 멤버 등록 |
+| `slack_team_create` | 팀 전용 채널 생성 + 초기 멤버 등록 (이름 충돌 시 기존 채널 재사용) |
 | `slack_team_register` | 기존 팀에 새 멤버 추가 |
-| `slack_team_send` | 에이전트가 역할 이름/아이콘으로 메시지 전송 (@멘션 지원) |
+| `slack_team_send` | 페르소나 이름/아이콘으로 메시지 전송 (@멘션 → 멘션 큐 저장) |
 | `slack_team_read` | 팀 채널 메시지 읽기 (sender 필터 가능) |
 | `slack_team_wait` | 팀 채널에서 새 메시지 대기 (sender/keyword 필터) |
 | `slack_team_thread` | 팀 스레드 읽기/답장 |
 | `slack_team_status` | 팀 현황/멤버 목록 조회 |
 | `slack_team_broadcast` | 팀 전체 브로드캐스트 |
-| `slack_team_report` | 팀원이 메인 채널 + 팀 채널에 작업 상황 보고 |
+| `slack_team_report` | 팀원이 메인 채널 + 팀 채널에 작업 상황 보고 (팀 메모리 없을 시 SQLite fallback) |
 | `slack_team_close` | 채널 아카이브 + 최종 요약 + 태스크 일괄 완료 |
+| `slack_mention_check` | @멘션 수신 확인 — 멤버 ID·역할·페르소나 이름으로 멘션 큐 조회 (peek 모드 지원) |
 
 ### 팀 컨텍스트 관리 (7개)
 
@@ -293,6 +324,21 @@ Slack App → OAuth & Permissions → Bot Token Scopes:
 | `slack_save_state` | 루프/팀 상태를 파일에 저장 (세션 복구용) |
 | `slack_load_state` | 저장된 상태 복원 + 팀 컨텍스트 요약 포함 |
 | `slack_cost_report` | ccusage로 Claude Code 토큰/비용 보고 (일별/월별) |
+
+### 대시보드 + 운영 (10개)
+
+| 도구 | 설명 |
+|------|------|
+| `slack_progress_dashboard` | 팀 작업 진행률 시각적 대시보드 (진행 바, 에이전트 상태, Rate Limiter 메트릭) |
+| `slack_heartbeat` | 에이전트 생존 신호(하트비트) 전송 |
+| `slack_heartbeat_status` | 모든 에이전트 하트비트 상태 조회 + 무응답 감지 알림 |
+| `slack_thread_summary` | 긴 스레드 자동 요약 (주요 메시지 추출, 참여자 통계) |
+| `slack_search_inbox` | 인박스 메시지 FTS5 전문검색 |
+| `slack_pin_message` | 메시지 고정/해제 |
+| `slack_send_dm` | 다이렉트 메시지(DM) 전송 |
+| `slack_schedule_message` | 예약 시간에 메시지 전송 (리마인더, 정기 보고) |
+| `slack_team_request_permission` | 팀원→리더 권한 요청 + 리액션/텍스트 응답 대기 |
+| `slack_list_permissions` | 대기 중인 권한 요청 목록 조회 |
 
 ## 사용 예시
 
@@ -470,6 +516,9 @@ MCP 서버는 메시지 길이에 따라 최적의 전송 방식을 자동 선�
 | `agent_context` | 에이전트별 컨텍스트 스냅샷 | 영구 |
 | `team_decisions` | 의사결정 이력 (승인, 설계, 우선순위) | 영구 |
 | `cost_reports` | Claude Code 비용 보고 이력 | 영구 |
+| `agent_heartbeats` | 에이전트 생존 신호 추적 | 영구 |
+| `scheduled_messages` | 예약 메시지 기록 | 영구 |
+| `permission_requests` | 팀 권한 요청 이력 | 영구 |
 | `kv_store` | 범용 키-값 저장소 (멘션 큐 등) | 영구 |
 
 ### 컨텍스트 압축(Compaction) 복구 흐름
